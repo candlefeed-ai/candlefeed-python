@@ -5,6 +5,9 @@
     cf = CandleFeed(api_key="cf_live_...")
     df = cf.get_ohlcv("BTCUSDT", interval="1h", limit=5)
 """
+from importlib.metadata import PackageNotFoundError as _PkgNotFound
+from importlib.metadata import version as _pkg_version
+
 from .client import CandleFeed
 from .exceptions import (
     AuthenticationError,
@@ -14,7 +17,10 @@ from .exceptions import (
     TierRestrictedError,
 )
 
-__version__ = "0.1.0"
+try:
+    __version__ = _pkg_version("candlefeed")
+except _PkgNotFound:  # running from a source checkout without an install
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "CandleFeed",

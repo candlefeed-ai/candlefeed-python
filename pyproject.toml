@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "candlefeed"
-version = "0.1.1"
+version = "0.1.2"
 description = "Official Python client for the CandleFeed crypto market-data API — OHLCV, funding, open interest, liquidations, basis, options. Returns pandas DataFrames."
 readme = "README.md"
 requires-python = ">=3.9"
