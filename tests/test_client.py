@@ -38,8 +38,9 @@ def test_auth_header_sent(client, fake_session):
 
 
 def test_repr_masks_key(client):
-    assert "cf_live_tes" in repr(client)
-    assert "testkey" not in repr(client).replace("cf_live_tes", "")
+    r = repr(client)
+    assert "cf_live_***" in r       # environment marker shown, secret redacted
+    assert "testkey" not in r        # no usable key material leaks
 
 
 # --------------------------------------------------------------------------- #

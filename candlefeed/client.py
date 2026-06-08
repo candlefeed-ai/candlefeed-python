@@ -104,7 +104,12 @@ class CandleFeed:
         self.last_rate_limit: Dict[str, Optional[str]] = {}
 
     def __repr__(self) -> str:
-        masked = f"{self.api_key[:11]}…" if len(self.api_key) > 11 else "set"
+        # Redact the secret — keep only the non-sensitive environment marker
+        # (cf_live_/cf_test_) so a rendered client in a published notebook
+        # never leaks usable key material.
+        key = self.api_key or ""
+        prefix = next((p for p in ("cf_live_", "cf_test_") if key.startswith(p)), "")
+        masked = f"{prefix}***" if key else "unset"
         return f"CandleFeed(base_url={self.base_url!r}, api_key={masked!r})"
 
     def close(self) -> None:
