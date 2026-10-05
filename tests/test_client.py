@@ -6,11 +6,15 @@ import pytest
 from conftest import FakeResponse, error, ok, page
 
 from candlefeed import (
+    BASIS_INTERVALS,
+    LIQUIDATIONS_AGGREGATED_INTERVALS,
+    OHLCV_INTERVALS,
     AuthenticationError,
     CandleFeed,
     InvalidParameterError,
     RateLimitError,
     TierRestrictedError,
+    __version__,
 )
 
 
@@ -294,3 +298,60 @@ def test_status_returns_dict(client, fake_session):
     fake_session.queue(FakeResponse(200, {"status": "ok", "api_version": "1.0.0"}))
     s = client.status()
     assert s["api_version"] == "1.0.0"
+
+
+# --------------------------------------------------------------------------- #
+# Coverage surface: intervals + response meta
+# --------------------------------------------------------------------------- #
+def test_documented_intervals_match_api():
+    """The exported interval tuples are the API's current accepted sets."""
+    assert OHLCV_INTERVALS == ("1m", "5m", "15m", "1h", "4h", "1d")
+    assert BASIS_INTERVALS == ("5m", "1h", "4h")
+    assert LIQUIDATIONS_AGGREGATED_INTERVALS == ("1h", "4h", "6h", "8h", "12h", "1d")
+
+
+@pytest.mark.parametrize("interval", ["1m", "5m", "15m", "1h", "4h", "1d"])
+def test_ohlcv_passes_every_interval_through(client, fake_session, interval):
+    fake_session.queue(ok([{"time": "2026-01-01T00:00:00Z", "close": "1"}]))
+    client.get_ohlcv("BTCUSDT", interval=interval, limit=1)
+    assert fake_session.calls[-1]["params"]["interval"] == interval
+
+
+@pytest.mark.parametrize("interval", ["5m", "1h", "4h"])
+def test_basis_passes_native_and_rollup_intervals(client, fake_session, interval):
+    fake_session.queue(ok([{"time": "2026-05-01T00:00:00Z", "close_basis": "0.01"}]))
+    client.get_basis("BTCUSDT", interval=interval, limit=1)
+    assert fake_session.calls[-1]["params"]["interval"] == interval
+
+
+def test_liquidations_aggregated_accepts_1h(client, fake_session):
+    fake_session.queue(ok([{"timestamp": "2026-05-01T00:00:00Z", "long_liq_usd": "1"}]))
+    client.get_liquidations_aggregated("BTCUSDT", interval="1h")
+    assert fake_session.calls[-1]["params"]["interval"] == "1h"
+
+
+def test_meta_history_from_is_exposed(client, fake_session):
+    meta = {"history_from": "2019-09-08T00:00:00Z", "interval": "1d", "total": 1}
+    fake_session.queue(
+        ok([{"timestamp": "2026-05-01T00:00:00Z", "long_liq_usd": "1"}], meta=meta)
+    )
+    df = client.get_liquidations_aggregated("BTCUSDT", interval="1d")
+    assert client.last_meta["history_from"] == "2019-09-08T00:00:00Z"
+    assert df.attrs["meta"]["history_from"] == "2019-09-08T00:00:00Z"
+
+
+def test_meta_is_cleared_when_response_has_none(client, fake_session):
+    fake_session.queue(
+        ok([{"time": "2026-01-01T00:00:00Z", "close_basis": "1"}], meta={"source": "native 5m"})
+    )
+    client.get_basis("BTCUSDT", interval="5m", limit=1)
+    assert client.last_meta["source"] == "native 5m"
+
+    fake_session.queue(ok([{"time": "2026-01-01T00:00:00Z", "close": "1"}]))
+    df = client.get_ohlcv("BTCUSDT", limit=1)
+    assert client.last_meta == {}
+    assert df.attrs["meta"] == {}
+
+
+def test_user_agent_tracks_package_version(client, fake_session):
+    assert fake_session.headers["User-Agent"] == f"candlefeed-python/{__version__}"

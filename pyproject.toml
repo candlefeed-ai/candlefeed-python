@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "candlefeed"
-version = "0.1.2"
-description = "Official Python client for the CandleFeed crypto market-data API — OHLCV, funding, open interest, liquidations, basis, options. Returns pandas DataFrames."
+version = "0.3.0"
+description = "Official Python client for the CandleFeed crypto market-data API — OHLCV, funding, open interest, liquidations, basis, Deribit options across Binance, Bybit, OKX, dYdX, Hyperliquid and Huobi. Returns pandas DataFrames."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -19,6 +19,12 @@ keywords = [
     "funding-rates",
     "open-interest",
     "liquidations",
+    "ohlcv",
+    "basis",
+    "deribit-options",
+    "order-book",
+    "l2",
+    "hyperliquid",
     "pandas",
 ]
 classifiers = [
@@ -44,9 +50,12 @@ dependencies = [
 
 [project.optional-dependencies]
 polars = ["polars>=0.20"]
+l2 = ["pyarrow>=12", "numpy>=1.21"]
 dev = [
     "pytest>=7.0",
     "responses>=0.23",
+    "pyarrow>=12",
+    "numpy>=1.21",
     "ruff>=0.4",
     "build>=1.0",
 ]
@@ -61,7 +70,7 @@ Repository = "https://github.com/candlefeed-ai/candlefeed-python"
 packages = ["candlefeed"]
 
 [tool.hatch.build.targets.sdist]
-include = ["candlefeed", "README.md", "LICENSE", "examples"]
+include = ["candlefeed", "README.md", "CHANGELOG.md", "LICENSE", "examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

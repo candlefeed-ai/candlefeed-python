@@ -8,11 +8,22 @@
 from importlib.metadata import PackageNotFoundError as _PkgNotFound
 from importlib.metadata import version as _pkg_version
 
-from .client import CandleFeed
+from .client import (
+    BASIS_INTERVALS,
+    FUNDING_AGGREGATED_INTERVALS,
+    L2_DATASETS,
+    LIQUIDATION_INTERVALS,
+    LIQUIDATIONS_AGGREGATED_INTERVALS,
+    LONG_SHORT_INTERVALS,
+    OHLCV_INTERVALS,
+    OPEN_INTEREST_INTERVALS,
+    CandleFeed,
+)
 from .exceptions import (
     AuthenticationError,
     CandleFeedError,
     InvalidParameterError,
+    QuotaExceededError,
     RateLimitError,
     TierRestrictedError,
 )
@@ -29,5 +40,14 @@ __all__ = [
     "TierRestrictedError",
     "InvalidParameterError",
     "RateLimitError",
+    "QuotaExceededError",
+    "L2_DATASETS",
+    "OHLCV_INTERVALS",
+    "OPEN_INTEREST_INTERVALS",
+    "FUNDING_AGGREGATED_INTERVALS",
+    "LIQUIDATION_INTERVALS",
+    "LIQUIDATIONS_AGGREGATED_INTERVALS",
+    "LONG_SHORT_INTERVALS",
+    "BASIS_INTERVALS",
     "__version__",
 ]

@@ -26,6 +26,14 @@ class FakeResponse:
             raise ValueError("no json body")
         return self._json
 
+    def iter_content(self, chunk_size: int = 1):
+        body = self.text.encode()
+        for i in range(0, len(body), chunk_size):
+            yield body[i:i + chunk_size]
+
+    def close(self) -> None:
+        pass
+
 
 class FakeSession:
     """Records requests and replays a scripted queue of responses."""
@@ -43,9 +51,10 @@ class FakeSession:
     def handler(self, fn: Callable[[str, dict], FakeResponse]) -> None:
         self._handler = fn
 
-    def get(self, url: str, params: Optional[dict] = None, timeout: float = 0) -> FakeResponse:
+    def get(self, url: str, params: Optional[dict] = None, timeout: float = 0,
+            allow_redirects: bool = True, stream: bool = False) -> FakeResponse:
         params = params or {}
-        self.calls.append({"url": url, "params": params})
+        self.calls.append({"url": url, "params": params, "allow_redirects": allow_redirects, "stream": stream})
         if self._handler is not None:
             return self._handler(url, params)
         if not self._queue:

@@ -64,3 +64,11 @@ class RateLimitError(CandleFeedError):
     ) -> None:
         self.retry_after = retry_after
         super().__init__(message, code=code, status_code=status_code)
+
+
+class QuotaExceededError(RateLimitError):
+    """Raised on HTTP 429 ``quota_exceeded`` or ``daily_download_limit`` for L2 files.
+
+    Not retried: the monthly sample-day allowance resets on the 1st (UTC) and the daily
+    download limit at 00:00 UTC. The message says which one and when.
+    """

@@ -1,27 +1,59 @@
 """CandleFeed API client — pandas-native access to crypto market data."""
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import shutil
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError as _PkgNotFound
+from importlib.metadata import version as _pkg_version
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
+import urllib3
 
+from . import _safefs
+from ._safefs import SafeDir, UnsafePath
 from .exceptions import (
     AuthenticationError,
     CandleFeedError,
     InvalidParameterError,
+    QuotaExceededError,
     RateLimitError,
     TierRestrictedError,
 )
 
-__all__ = ["CandleFeed"]
+__all__ = [
+    "CandleFeed",
+    "OHLCV_INTERVALS",
+    "OPEN_INTEREST_INTERVALS",
+    "FUNDING_AGGREGATED_INTERVALS",
+    "LIQUIDATION_INTERVALS",
+    "LIQUIDATIONS_AGGREGATED_INTERVALS",
+    "LONG_SHORT_INTERVALS",
+    "BASIS_INTERVALS",
+    "L2_DATASETS",
+]
 
 DEFAULT_BASE_URL = "https://candlefeed.ai/api/v1"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 4
+
+# Intervals the API accepts per dataset. Exposed for reference/validation in
+# calling code — the client itself does not reject unknown values, so a newly
+# shipped interval works before this list catches up.
+OHLCV_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
+OPEN_INTEREST_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
+FUNDING_AGGREGATED_INTERVALS = ("1h", "4h", "1d")
+LIQUIDATION_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
+LIQUIDATIONS_AGGREGATED_INTERVALS = ("1h", "4h", "6h", "8h", "12h", "1d")
+LONG_SHORT_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
+BASIS_INTERVALS = ("5m", "1h", "4h")
 
 TimeLike = Union[str, datetime, None]
 
@@ -44,6 +76,57 @@ _NUMERIC_COLUMNS = {
 # Candidate timestamp column names, in priority order. The API uses ``time`` on
 # most endpoints and ``timestamp`` on the aggregated ones.
 _TIME_COLUMNS = ("time", "timestamp")
+
+L2_DATASETS = ("book", "trades")
+# Presigned download links must point here (https, port 443). Override with storage_host= or
+# CANDLEFEED_L2_STORAGE_HOST if CandleFeed ever moves the bucket.
+DEFAULT_L2_STORAGE_HOST = "candlefeed-l2-canonical.sgp1.digitaloceanspaces.com"
+# Download links last 15 minutes; ask for fresh ones a little before that.
+_L2_URL_REFRESH_SECONDS = 12 * 60
+_L2_MAX_DAYS_PER_CALL = 31
+# A BTCUSDT hour file is tens of MB; anything listed above this is refused.
+_L2_MAX_FILE_BYTES = 4 * 1024 ** 3
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_L2_DISK_HEADROOM = 64 * 1024 ** 2
+# Bodies are read in small chunks so the download deadline is checked often.
+_BODY_CHUNK = 8 * 1024
+_MAX_API_BODY = 64 * 1024 ** 2
+# The only files a day may contain; anything else in a listing is refused.
+_L2_FILE_NAMES = {
+    "book": frozenset([f"depth/{h:02d}.parquet" for h in range(24)] + ["snapshot.parquet", "manifest.json"]),
+    "trades": frozenset(["trades.parquet", "manifest.json"]),
+}
+# 429s that a retry within this process cannot clear (monthly allowance, daily download limit).
+_NON_RETRYABLE_429 = ("quota_exceeded", "daily_download_limit")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+try:
+    _CLIENT_VERSION = _pkg_version("candlefeed")
+except _PkgNotFound:  # running from a source checkout without an install
+    _CLIENT_VERSION = "0.0.0+unknown"
+
+
+def _to_day(value: Union[str, date, datetime, None]) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+# Any query string, on an absolute URL or a relative one (urllib3 reports "with url: /path?X-Amz-...").
+_URL_QUERY_RE = re.compile(r"(?i)(\?|%3F)[^\s'\")]*")
+_CREDENTIAL_RE = re.compile(
+    r"(?i)\b(X-Amz-[A-Za-z-]+|Signature|Expires|AWSAccessKeyId|x-amz-security-token)(=|%3D)[^\s&'\")]*")
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Exception class and message with every URL query string removed: a presigned download link's query
+    is a bearer credential, and requests puts the full URL in connection errors."""
+    message = _CREDENTIAL_RE.sub(r"\1\2<redacted>", _URL_QUERY_RE.sub(r"\1<redacted>", str(exc)))
+    return f"{type(exc).__name__}: {message}"
 
 
 def _to_iso(value: TimeLike) -> Optional[str]:
@@ -80,6 +163,8 @@ class CandleFeed:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         session: Optional[requests.Session] = None,
+        download_session: Optional[requests.Session] = None,
+        storage_host: Optional[str] = None,
     ) -> None:
         key = api_key or os.environ.get("CANDLEFEED_API_KEY")
         if not key:
@@ -98,10 +183,21 @@ class CandleFeed:
             {
                 "X-API-Key": self.api_key,
                 "Accept": "application/json",
-                "User-Agent": "candlefeed-python/0.1.0",
+                "User-Agent": f"candlefeed-python/{_CLIENT_VERSION}",
             }
         )
+        # File downloads go to presigned storage URLs; this session never carries the API key.
+        self._download_session = download_session
+        self.storage_host = (storage_host or os.environ.get("CANDLEFEED_L2_STORAGE_HOST")
+                             or DEFAULT_L2_STORAGE_HOST).strip().lower()
         self.last_rate_limit: Dict[str, Optional[str]] = {}
+        self._deadline_at: Optional[float] = None
+        self._in_download = False
+        # ``meta`` block from the most recent response — carries per-request
+        # provenance such as ``history_from`` (earliest bucket available for the
+        # requested exchange/symbol/interval) and ``source`` (native vs
+        # resampled). Also attached to each returned frame as ``df.attrs["meta"]``.
+        self.last_meta: Dict[str, Any] = {}
 
     def __repr__(self) -> str:
         # Redact the secret — keep only the non-sensitive environment marker
@@ -133,20 +229,37 @@ class CandleFeed:
         attempt = 0
         while True:
             try:
-                resp = self._session.get(url, params=clean, timeout=self.timeout)
+                # Never follow redirects: requests would carry the X-API-Key header to the new origin.
+                if not self._in_download:
+                    resp = self._session.get(url, params=clean, timeout=self._timeouts(url), allow_redirects=False)
+                else:
+                    # inside download_l2 every listing (refreshes too) streams through the capped reader, which
+                    # also checks the deadline when one is set
+                    resp = self._session.get(url, params=clean, timeout=self._timeouts(url), allow_redirects=False,
+                                             stream=True)
+                    self._read_api_body(resp, url)
             except requests.RequestException as exc:
                 if attempt < self.max_retries:
-                    time.sleep(self._backoff(attempt))
+                    self._sleep(self._backoff(attempt), url)
                     attempt += 1
                     continue
-                raise CandleFeedError(f"Request to {url} failed: {exc}") from exc
+                raise CandleFeedError(f"Request to {url} failed: {_describe_error(exc)}") from None
 
             self._capture_rate_limit(resp)
 
+            if 300 <= resp.status_code < 400:
+                raise CandleFeedError(
+                    f"The API answered HTTP {resp.status_code} with a redirect. The client doesn't follow "
+                    "redirects, so your API key is only ever sent to the configured base URL.",
+                    status_code=resp.status_code)
+
             if resp.status_code == 429:
+                code, message = self._extract_error(resp)
+                if code in _NON_RETRYABLE_429:
+                    raise QuotaExceededError(message or "Download limit reached.", code=code, status_code=429)
                 retry_after = self._retry_after_seconds(resp)
                 if attempt < self.max_retries:
-                    time.sleep(retry_after if retry_after is not None else self._backoff(attempt))
+                    self._sleep(retry_after if retry_after is not None else self._backoff(attempt), url)
                     attempt += 1
                     continue
                 code, message = self._extract_error(resp)
@@ -161,11 +274,15 @@ class CandleFeed:
                 self._raise_for_error(resp)
 
             try:
-                return resp.json()
+                body = resp.json()
             except ValueError as exc:
                 raise CandleFeedError(
                     f"Non-JSON response from {url} (HTTP {resp.status_code})."
                 ) from exc
+
+            meta = body.get("meta") if isinstance(body, dict) else None
+            self.last_meta = meta if isinstance(meta, dict) else {}
+            return body
 
     def _raise_for_error(self, resp: requests.Response) -> None:
         code, message = self._extract_error(resp)
@@ -284,7 +401,9 @@ class CandleFeed:
         max_rows: Optional[int],
     ) -> pd.DataFrame:
         rows = self._fetch(path, params, paginate=paginate, max_rows=max_rows)
-        return self._to_frame(rows)
+        df = self._to_frame(rows)
+        df.attrs["meta"] = dict(self.last_meta)
+        return df
 
     # ------------------------------------------------------------------ #
     # OHLCV / candles
@@ -302,8 +421,16 @@ class CandleFeed:
     ) -> pd.DataFrame:
         """Historical OHLCV candles.
 
-        Intervals: ``1m, 5m, 15m, 1h, 4h, 1d``. Returns a DataFrame indexed by
-        ``time`` with ``open, high, low, close, volume, quote_volume`` columns.
+        Intervals: ``1m, 5m, 15m, 1h, 4h, 1d`` — stored natively at 1m and
+        resampled on request, so every higher interval is consistent with the
+        underlying minute bars. Returns a DataFrame indexed by ``time`` with
+        ``open, high, low, close, volume, quote_volume`` columns.
+
+        Exchanges: ``binance`` (perp, the default), ``binance_spot``, ``bybit``,
+        ``okx``, ``dydx``, ``hyperliquid``. History starts differ by venue —
+        Binance spot 2017, Binance perp 2019, OKX/Bybit 2020, Hyperliquid 1d
+        2023 / 4h 2024 / 1h 2025 / 1m–15m 2026, dYdX 2025. See
+        https://candlefeed.ai/coverage/ for the per-venue matrix.
         """
         params = {
             "symbol": symbol,
@@ -330,7 +457,13 @@ class CandleFeed:
         paginate: bool = True,
         max_rows: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Per-exchange funding rates (``funding_rate``, ``mark_price``)."""
+        """Per-exchange funding rates (``funding_rate``, ``mark_price``).
+
+        Native settlement cadence (8h on most venues), not a resampled series.
+        Exchanges: ``binance`` (from 2020), ``okx``, ``bybit``, ``dydx``,
+        ``hyperliquid`` — Hyperliquid is hourly and continuous from each
+        contract's HL listing (BTC/ETH/SOL from 2023-05-12).
+        """
         params = {
             "symbol": symbol,
             "exchange": exchange,
@@ -418,6 +551,11 @@ class CandleFeed:
         usd_value``); pass an interval (``1m, 5m, 15m, 1h, 4h, 1d``) for bucketed
         ``long_liq_usd / short_liq_usd / total_liq_usd / count``. ``side`` filters
         to ``long`` or ``short``.
+
+        Tick-level liquidations are forward-collected and start in late May 2026
+        — OKX 2026-05-27, Binance/Bybit/Hyperliquid 2026-05-28, Huobi
+        2026-06-02. There is no pre-2026 tick history on any venue; for
+        long-horizon work use :meth:`get_liquidations_aggregated` at ``1d``.
         """
         params = {
             "symbol": symbol,
@@ -439,12 +577,21 @@ class CandleFeed:
         end: TimeLike = None,
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Pre-aggregated liquidation history (CoinGlass backfill).
+        """Pre-aggregated liquidation history (native cross-venue rollup).
 
-        Intervals: ``4h, 6h, 8h, 12h, 1d``. Returns ``long_liq_usd``,
+        Intervals: ``1h, 4h, 6h, 8h, 12h, 1d``. Returns ``long_liq_usd``,
         ``short_liq_usd`` indexed by ``timestamp``. This endpoint is not
         cursor-paginated (it returns ``meta.total``); use ``limit`` to size the
         single page.
+
+        Depth varies by interval. ``1d`` is the deep series, running from each
+        contract's perpetual listing — Binance 2019-09, Bybit 2020-01,
+        OKX/Huobi 2022-04, Hyperliquid 2026-05. The sub-daily buckets are
+        forward-built and start between 2023 and 2026 by venue, so use
+        ``interval="1d"`` for multi-year backtests. The response ``meta`` block
+        carries ``history_from`` for the exact exchange/symbol/interval asked
+        for; it is available afterwards as ``cf.last_meta`` and on the returned
+        frame as ``df.attrs["meta"]``.
         """
         params = {
             "symbol": symbol,
@@ -455,7 +602,9 @@ class CandleFeed:
             "limit": limit,
         }
         body = self._request("liquidations/aggregated", params)
-        return self._to_frame(body.get("data") or [])
+        df = self._to_frame(body.get("data") or [])
+        df.attrs["meta"] = dict(self.last_meta)
+        return df
 
     # ------------------------------------------------------------------ #
     # Long/short ratio
@@ -475,7 +624,8 @@ class CandleFeed:
         """Long/short account ratio.
 
         Intervals: ``5m, 15m, 1h, 4h, 1d``. ``ratio_type`` is one of
-        ``top_account`` (default), ``global_account``, or ``both``.
+        ``top_account`` (default), ``global_account``, or ``both``. Binance
+        only, from 2020.
         """
         params = {
             "symbol": symbol,
@@ -501,7 +651,10 @@ class CandleFeed:
         paginate: bool = True,
         max_rows: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Taker buy/sell volume (``buy_volume, sell_volume, buy_sell_ratio``)."""
+        """Taker buy/sell volume (``buy_volume, sell_volume, buy_sell_ratio``).
+
+        True 5-minute data from each symbol's listing (BTC 2019-09). Binance only.
+        """
         params = {
             "symbol": symbol,
             "exchange": exchange,
@@ -527,7 +680,10 @@ class CandleFeed:
     ) -> pd.DataFrame:
         """Futures basis / premium (``open_basis, close_basis, ...``).
 
-        Intervals: ``1h, 4h``.
+        Intervals: ``5m`` (native), ``1h``, ``4h``. Binance only, across all 52
+        symbols — 5m from 2026-04-27, 1h from 2025-12-10, 4h from 2025-05-31.
+        ``meta.source`` on the response says whether the series came back native
+        or resampled from the 5m base.
         """
         params = {
             "symbol": symbol,
@@ -592,6 +748,12 @@ class CandleFeed:
 
         ``currency`` is ``BTC`` or ``ETH``. Optional filters: ``instrument_name``,
         ``option_type`` (``C``/``P``), ``expiry`` (``YYYY-MM-DD``).
+
+        The API serves a rolling ~60-day window of chain snapshots; anything
+        older is archived to object storage and is not queryable here. Greeks
+        are captured natively from Deribit from June 2026 onward; earlier greeks
+        are computed via Black-76 from the stored implied volatility (IV and
+        open interest are native throughout).
         """
         params = {
             "currency": currency,
@@ -629,3 +791,343 @@ class CandleFeed:
     def status(self) -> Dict[str, Any]:
         """API health and per-dataset data freshness (raw dict)."""
         return self._request("status", {})
+
+    # ------------------------------------------------------------------ #
+    # L2 order book and raw trades (daily Parquet files)
+    # ------------------------------------------------------------------ #
+    def l2_files(
+        self,
+        dataset: str,
+        symbol: str,
+        start: Union[str, date, datetime],
+        end: Union[str, date, datetime, None] = None,
+    ) -> Dict[str, Any]:
+        """List the daily L2 files for a symbol, with 15-minute download links.
+
+        ``dataset`` is ``"book"`` (hourly diff files plus the day's REST snapshots) or ``"trades"``
+        (one file of raw tick trades). Binance USD-M perpetuals, UTC days, at most 31 days per call.
+        Pro and Enterprise get every day; other plans get the 1st of each month, up to 10 GiB of
+        new files per month.
+
+        Returns the raw response: ``days`` (each with ``files``: name, key, size, sha256, url, rows,
+        and a QC ``summary``), ``missing`` (days not available, with a reason) and ``usage``.
+        """
+        if dataset not in L2_DATASETS:
+            raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
+        first = _to_day(start)
+        last = _to_day(end) if end is not None else None
+        return self._request("l2/files", {
+            "dataset": dataset,
+            "symbol": symbol.upper(),
+            "start": first.isoformat() if first else None,
+            "end": last.isoformat() if last else None,
+        })
+
+    def l2_coverage(self, dataset: Optional[str] = None, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Published L2 days per dataset and symbol: first and last day, day count, and any days in
+        between that aren't published, with the reason. Public endpoint, cached for 10 minutes."""
+        if dataset is not None and dataset not in L2_DATASETS:
+            raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
+        return self._request("l2/coverage", {"dataset": dataset, "symbol": symbol.upper() if symbol else None})
+
+    def l2_gaps(
+        self,
+        dataset: Optional[str] = None,
+        symbol: Optional[str] = None,
+        start: Union[str, date, datetime, None] = None,
+        end: Union[str, date, datetime, None] = None,
+    ) -> Dict[str, Any]:
+        """The public gap log: every stretch on a published day that none of the three capture nodes
+        recorded, each with the reason. Public endpoint, cached for 10 minutes."""
+        if dataset is not None and dataset not in L2_DATASETS:
+            raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
+        first, last = _to_day(start), _to_day(end)
+        return self._request("l2/gaps", {
+            "dataset": dataset,
+            "symbol": symbol.upper() if symbol else None,
+            "start": first.isoformat() if first else None,
+            "end": last.isoformat() if last else None,
+        })
+
+    def download_l2(
+        self,
+        dataset: str,
+        symbol: str,
+        start: Union[str, date, datetime],
+        end: Union[str, date, datetime, None],
+        dest_dir: Union[str, os.PathLike],
+        verify: bool = True,
+        max_bytes: Optional[int] = None,
+        max_file_bytes: int = _L2_MAX_FILE_BYTES,
+        deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Download daily L2 files to ``dest_dir/<dataset>/binance/<SYMBOL>/<YYYY-MM-DD>/``.
+
+        Ranges longer than 31 days are split into several calls. Each file streams to a ``.part``
+        file and is renamed into place only after its size (and, with ``verify=True``, its SHA-256)
+        matches what the API reported. Files already on disk with a matching hash are skipped, so a
+        rerun resumes. Network errors and 5xx responses are retried with backoff, and expired links
+        are refreshed. Days the API can't serve are returned under ``missing``, not raised.
+
+        Limits: the listing is refused if any file is bigger than ``max_file_bytes`` or the files still
+        to fetch add up to more than ``max_bytes`` (checked per 31-day call, before that call downloads
+        anything). A stream that runs past its listed size is cut off at once.
+
+        ``deadline`` (seconds) is checked before every request, file and retry wait, and after each chunk
+        requests yields while reading a response body, listings included (8 KiB chunks are requested; a
+        compressed response can yield larger decoded chunks). Each request's connect and read timeouts are
+        cut to the time left. It isn't a hard time limit: a server that keeps sending bytes, each gap shorter
+        than the read timeout, can stretch one chunk's read past the deadline for as long as it keeps that up.
+        Listings are always read through a 64 MiB cap here, with or without a deadline.
+
+        Returns ``{"downloaded": [paths], "skipped": [paths], "missing": [...], "bytes": n}``.
+        """
+        if dataset not in L2_DATASETS:
+            raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
+        symbol = symbol.upper()
+        if not re.match(r"^[A-Z0-9]{2,30}$", symbol):
+            raise InvalidParameterError("symbol must look like BTCUSDT", code="invalid_parameter")
+        first = _to_day(start)
+        last = _to_day(end) if end is not None else first
+        if first is None or last is None or last < first:
+            raise InvalidParameterError("end must be on or after start", code="invalid_parameter")
+        if not _safefs.DIR_FD:
+            raise CandleFeedError(
+                "download_l2 needs directory-relative, no-follow file operations (dir_fd and O_NOFOLLOW) to keep "
+                "writes inside dest_dir, and this Python doesn't provide them. They're available in CPython on "
+                "Linux and macOS. Nothing was downloaded.", code="unsupported_platform")
+        result: Dict[str, Any] = {"downloaded": [], "skipped": [], "missing": [], "bytes": 0}
+        limits = {"max_bytes": max_bytes, "max_file_bytes": max_file_bytes,
+                  "deadline_at": None if deadline is None else time.monotonic() + deadline}
+        self._deadline_at = limits["deadline_at"]
+        self._in_download = True
+        try:
+            window = first
+            while window <= last:
+                window_end = min(window + timedelta(days=_L2_MAX_DAYS_PER_CALL - 1), last)
+                self._download_l2_window(dataset, symbol, window, window_end, Path(dest_dir), verify, result, limits)
+                window = window_end + timedelta(days=1)
+        finally:
+            self._deadline_at = None
+            self._in_download = False
+        return result
+
+    @staticmethod
+    def _check_l2_listing(listing: Dict[str, Any], dataset: str, first: date, last: date,
+                          max_file_bytes: int = _L2_MAX_FILE_BYTES) -> List[Dict[str, Any]]:
+        """Every day must be one that was asked for, once, and every file one of the names this dataset
+        publishes, once. Anything else is refused before a byte is written."""
+        days = listing.get("days") or []
+        if not isinstance(days, list):
+            raise CandleFeedError("Unexpected L2 listing: days is not a list")
+        seen = set()
+        for day in days:
+            d = str(day.get("date")) if isinstance(day, dict) else None
+            try:
+                ok = bool(d and _DATE_RE.match(d)) and first <= date.fromisoformat(d) <= last and d not in seen
+            except ValueError:
+                ok = False
+            if not ok:
+                raise CandleFeedError(f"Unexpected day in response: {d!r} (asked for {first} to {last})")
+            seen.add(d)
+            files = day.get("files")
+            if not isinstance(files, list):
+                raise CandleFeedError(f"Unexpected L2 listing for {d}: files is not a list")
+            names = set()
+            for f in files:
+                name = f.get("name") if isinstance(f, dict) else None
+                if name not in _L2_FILE_NAMES[dataset] or name in names:
+                    raise CandleFeedError(f"Refusing unsafe or unexpected file name from the API: {name!r}")
+                names.add(name)
+                size, sha, key, url = f.get("size"), f.get("sha256"), f.get("key"), f.get("url")
+                if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= max_file_bytes:
+                    raise CandleFeedError(f"Refusing {name} for {d}: listed size {size!r} is outside 0..{max_file_bytes}")
+                if not isinstance(sha, str) or not _SHA256_RE.match(sha):
+                    raise CandleFeedError(f"Refusing {name} for {d}: listed sha256 isn't 64 hex characters")
+                if not isinstance(key, str) or not 0 < len(key) <= 1024 or not isinstance(url, str) or len(url) > 8192:
+                    raise CandleFeedError(f"Refusing {name} for {d}: malformed key or link")
+        return days
+
+    @staticmethod
+    def _open_l2_folder(dest_dir: Path, parts: List[str], f: Dict[str, Any], day: str) -> SafeDir:
+        try:
+            return SafeDir(dest_dir, parts)
+        except UnsafePath as exc:
+            raise CandleFeedError(f"Refusing to write {f['name']} for {day}: {exc}") from None
+
+    def _download_l2_window(self, dataset, symbol, first, last, dest_dir: Path, verify, result, limits):
+        listing = self.l2_files(dataset, symbol, first, last)
+        days = self._check_l2_listing(listing, dataset, first, last, limits["max_file_bytes"])
+        # One decision per file, made once: a file counts as cached only if it's a plain file with the listed
+        # size and (with verify) hash. The same decision drives the budget check and the skip below, so a
+        # same-sized but corrupt file is budgeted as the download it will become.
+        plan = []
+        for day in days:
+            for f in day["files"]:
+                self._check_deadline(limits["deadline_at"], f["name"])
+                sub, _, fname = f["name"].rpartition("/")
+                parts = [dataset, "binance", symbol, day["date"]] + ([sub] if sub else [])
+                with self._open_l2_folder(dest_dir, parts, f, day["date"]) as folder:
+                    cached = folder.regular_size(fname) == f["size"] and (
+                        not verify or folder.sha256(fname) == f["sha256"])
+                plan.append((day["date"], f, parts, fname, cached))
+        need = sum(f["size"] for _, f, _, _, cached in plan if not cached)
+        if limits["max_bytes"] is not None and result["bytes"] + need > limits["max_bytes"]:
+            raise CandleFeedError(
+                f"{first} to {last} needs {need:,} bytes of new files, over the budget of "
+                f"{limits['max_bytes']:,} bytes ({result['bytes']:,} already downloaded in this call). "
+                "Nothing was downloaded for this range.", code="download_budget")
+        result["missing"].extend(listing.get("missing") or [])
+        urls: Dict[str, str] = {}
+        issued = [0.0]
+
+        def refresh(from_day: str) -> None:
+            self._check_deadline(limits["deadline_at"], "a fresh listing")
+            fresh = listing if not urls else self.l2_files(dataset, symbol, from_day, last)
+            fresh_days = self._check_l2_listing(fresh, dataset, date.fromisoformat(from_day), last,
+                                                limits["max_file_bytes"])
+            urls.update({f["key"]: self._checked_download_url(f["url"]) for d in fresh_days for f in d["files"]})
+            issued[0] = time.monotonic()
+
+        refresh(first.isoformat())
+        for day, f, parts, fname, cached in plan:
+            with self._open_l2_folder(dest_dir, parts, f, day) as folder:
+                path = folder.path / fname
+                if cached:
+                    result["skipped"].append(str(path))
+                    continue
+                if limits["max_bytes"] is not None and result["bytes"] + f["size"] > limits["max_bytes"]:
+                    raise CandleFeedError(f"Fetching {f['name']} for {day} would pass the budget of "
+                                          f"{limits['max_bytes']:,} bytes.", code="download_budget")
+                # the .part sits next to the old file until the rename, so its full size must fit on disk now
+                free = shutil.disk_usage(folder.path).free
+                if free < f["size"] + _L2_DISK_HEADROOM:
+                    raise CandleFeedError(f"Not enough disk space for {f['name']} for {day}: it needs "
+                                          f"{f['size']:,} bytes plus {_L2_DISK_HEADROOM:,} spare, and "
+                                          f"{free:,} are free.", code="disk_space")
+                if time.monotonic() - issued[0] > _L2_URL_REFRESH_SECONDS:
+                    refresh(day)
+                self._fetch_l2_file(urls, f, folder, fname, verify, lambda d=day: refresh(d), limits["deadline_at"])
+            result["downloaded"].append(str(path))
+            result["bytes"] += f["size"]
+
+    def _checked_download_url(self, url: Any) -> str:
+        """Only https links to the configured storage host on port 443, without credentials, are fetched,
+        so a bad listing can't point the client at localhost, a private network or any other server."""
+        try:
+            u = urlsplit(str(url))
+            port = u.port
+        except ValueError:
+            u, port = None, -1
+        if (u is None or u.scheme != "https" or (u.hostname or "").lower() != self.storage_host
+                or port not in (None, 443) or u.username is not None or u.password is not None):
+            where = "an unparseable link" if u is None else f"{u.scheme}://{u.hostname}"
+            raise CandleFeedError(f"Refusing a download link to {where}: L2 files are only fetched over "
+                                  f"https from {self.storage_host}.")
+        return str(url)
+
+    def _timeouts(self, what: str):
+        """Connect and read timeouts, cut to the time left when a download_l2 deadline is running."""
+        if self._deadline_at is None:
+            return self.timeout
+        left = self._deadline_at - time.monotonic()
+        if left <= 0:
+            self._check_deadline(self._deadline_at, what)
+        t = min(self.timeout, left)
+        return (t, t)
+
+    def _sleep(self, seconds: float, what: str) -> None:
+        if self._deadline_at is not None and time.monotonic() + seconds > self._deadline_at:
+            raise CandleFeedError(f"Download deadline would pass while waiting to retry {what}; rerun to resume, "
+                                  "finished files are kept.", code="download_deadline")
+        time.sleep(seconds)
+
+    @staticmethod
+    def _body_chunks(resp):
+        """The body in small chunks. iter_content applies the response's Content-Encoding and turns urllib3
+        errors into requests exceptions, which the retry logic handles."""
+        return resp.iter_content(chunk_size=_BODY_CHUNK)
+
+    def _read_api_body(self, resp, what: str) -> None:
+        """Read a streamed API response with the deadline checked after every chunk, then hand it back to
+        requests so .json() works as usual."""
+        data = bytearray()
+        try:
+            for chunk in self._body_chunks(resp):
+                data += chunk
+                if len(data) > _MAX_API_BODY:
+                    raise CandleFeedError(f"Response from {what} is over {_MAX_API_BODY:,} bytes; stopped.")
+                self._check_deadline(self._deadline_at, what)
+        finally:
+            resp.close()
+        resp._content = bytes(data)
+        resp._content_consumed = True
+
+    @staticmethod
+    def _check_deadline(deadline_at: Optional[float], what: str) -> None:
+        if deadline_at is not None and time.monotonic() > deadline_at:
+            raise CandleFeedError(f"Download deadline passed while fetching {what}; rerun to resume, "
+                                  "finished files are kept.", code="download_deadline")
+
+    def _fetch_l2_file(self, urls, f, folder: SafeDir, fname: str, verify: bool, refresh,
+                       deadline_at: Optional[float] = None) -> None:
+        if self._download_session is None:
+            self._download_session = requests.Session()
+            self._download_session.headers["User-Agent"] = f"candlefeed-python/{_CLIENT_VERSION}"
+        part = fname + ".part"
+        problem = "no attempt made"
+        try:
+            for attempt in range(self.max_retries + 1):
+                if attempt:
+                    self._sleep(self._backoff(attempt - 1), f["name"])
+                self._check_deadline(deadline_at, f["name"])
+                try:
+                    resp = self._download_session.get(urls[f["key"]], stream=True,
+                                                      timeout=self._timeouts(f["name"]), allow_redirects=False)
+                except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                    problem = f"network error: {_describe_error(exc)}"
+                    continue
+                try:
+                    if 300 <= resp.status_code < 400:
+                        raise CandleFeedError(f"Download of {f['name']} answered HTTP {resp.status_code} with a "
+                                              "redirect, which the client doesn't follow.",
+                                              status_code=resp.status_code)
+                    if resp.status_code in (401, 403):
+                        problem = f"HTTP {resp.status_code} (link expired?)"
+                        refresh()
+                        continue
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        problem = f"HTTP {resp.status_code}"
+                        continue
+                    if resp.status_code != 200:
+                        raise CandleFeedError(f"Download of {f['name']} failed with HTTP {resp.status_code}",
+                                              status_code=resp.status_code)
+                    h, size = hashlib.sha256(), 0
+                    folder.unlink(part)            # a stale .part, or a symlink planted in its place, goes first
+                    with folder.create_exclusive(part) as out:
+                        for chunk in self._body_chunks(resp):
+                            if not chunk:
+                                continue
+                            if size + len(chunk) > f["size"]:
+                                raise CandleFeedError(f"Download of {f['name']} ran past its listed size of "
+                                                      f"{f['size']:,} bytes; stopped.", code="oversized_download")
+                            out.write(chunk)
+                            h.update(chunk)
+                            size += len(chunk)
+                            self._check_deadline(deadline_at, f["name"])
+                except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                    problem = f"network error: {_describe_error(exc)}"
+                    continue
+                finally:
+                    resp.close()
+                if size != f["size"]:
+                    problem = f"got {size} bytes, expected {f['size']}"
+                    continue
+                if verify and h.hexdigest() != f["sha256"]:
+                    problem = "SHA-256 mismatch"
+                    continue
+                folder.replace(part, fname)
+                return
+            raise CandleFeedError(f"Could not download {f['name']} after {self.max_retries + 1} attempts: {problem}")
+        finally:
+            folder.unlink(part)                # every exit: success (already renamed), failure, deadline, error
