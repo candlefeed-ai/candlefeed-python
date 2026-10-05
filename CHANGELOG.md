@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+- New no-account sample download: `CandleFeed(public=True).download_l2_sample("BTCUSDT", "2026-10-01", "data/")`
+  fetches one of the sample days the API offers without an API key, into the same folder layout as
+  `download_l2`, with the same size and SHA-256 checks, atomic rename, resume and link refresh.
+  `l2_sample()` lists the days on offer. The server limits listings and bytes per address.
+- `CandleFeed(public=True)` makes a client that never sends a key, even if `CANDLEFEED_API_KEY` is set or the
+  `session` it's given carries an `X-API-Key` header (removed from every request, any capitalisation). Error
+  messages redact a key found on the session too. Without `public=True`, a missing key still raises
+  `AuthenticationError`.
+- A 429 `sample_daily_limit` raises `QuotaExceededError` straight away with the server's message, like the other
+  daily and monthly allowances, instead of waiting until the next UTC day.
+
 ## 0.3.1
 
 - The README says how to get a key before the first code example, with a link to the free signup page.

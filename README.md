@@ -150,6 +150,16 @@ the client raises `QuotaExceededError` straight away instead of retrying.
 
 `cf.l2_coverage()` and `cf.l2_gaps()` return the public coverage table and gap log (no plan needed).
 
+A few sample days can be downloaded without an account (version 0.3.2 or later), with the same checks:
+
+```python
+from candlefeed import CandleFeed
+
+public = CandleFeed(public=True)        # never sends a key
+print(public.l2_sample()["samples"])    # the days on offer
+public.download_l2_sample("BTCUSDT", "2026-10-01", "data/")
+```
+
 ### Rebuilding the book
 
 `candlefeed.l2book` turns a downloaded `book` day into an order book you can query. It needs pyarrow:

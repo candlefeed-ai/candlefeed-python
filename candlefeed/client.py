@@ -108,7 +108,7 @@ _L2_FILE_NAMES = {
     "trades": frozenset(["trades.parquet", "manifest.json"]),
 }
 # 429s that a retry within this process cannot clear (monthly allowance, daily download limit).
-_NON_RETRYABLE_429 = ("quota_exceeded", "daily_download_limit")
+_NON_RETRYABLE_429 = ("quota_exceeded", "daily_download_limit", "sample_daily_limit")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 try:
@@ -192,10 +192,13 @@ def _no_key_in_errors(method):
         try:
             return method(self, *args, **kwargs)
         except CandleFeedError as exc:
-            key = self.api_key
+            keys = self._known_keys()
 
             def clean(v):
-                return v.replace(key, "***") if key and isinstance(v, str) else v
+                if isinstance(v, str):
+                    for key in keys:
+                        v = v.replace(key, "***")
+                return v
             exc.message, exc.code = clean(exc.message), clean(exc.code)
             exc.args = tuple(clean(a) for a in exc.args)
             raise
@@ -231,6 +234,9 @@ class CandleFeed:
             a server sending a byte at a time could otherwise keep a request open indefinitely. A stall inside
             a single read (slow headers, say) is bounded by ``timeout``, not by this. ``None`` turns it off.
         session: Optional pre-configured :class:`requests.Session`.
+        public: Make a client without an API key (``CANDLEFEED_API_KEY`` is ignored too, and an ``X-API-Key`` on a
+            supplied session is removed from every request). It can only call the no-account endpoints:
+            :meth:`l2_sample`, :meth:`download_l2_sample`, :meth:`l2_coverage`, :meth:`l2_gaps`.
     """
 
     def __init__(
@@ -243,9 +249,10 @@ class CandleFeed:
         download_session: Optional[requests.Session] = None,
         storage_host: Optional[str] = None,
         request_deadline: Optional[float] = DEFAULT_REQUEST_DEADLINE,
+        public: bool = False,
     ) -> None:
-        key = api_key or os.environ.get("CANDLEFEED_API_KEY")
-        if not key:
+        key = None if public else (api_key or os.environ.get("CANDLEFEED_API_KEY"))
+        if not key and not public:
             raise AuthenticationError(
                 "No API key provided. Pass api_key= or set CANDLEFEED_API_KEY. "
                 "Get a free key (no card, about a minute) at "
@@ -253,6 +260,7 @@ class CandleFeed:
                 code="unauthorized",
             )
         self.api_key = key
+        self.public = public
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
@@ -261,12 +269,13 @@ class CandleFeed:
         self._session = session or requests.Session()
         self._session.headers.update(
             {
-                "X-API-Key": self.api_key,
                 "Accept": "application/json",
                 "Accept-Encoding": _ACCEPT,                 # the encodings _body_chunks decodes itself
                 "User-Agent": f"candlefeed-python/{_CLIENT_VERSION}",
             }
         )
+        if key:
+            self._session.headers["X-API-Key"] = key
         # File downloads go to presigned storage URLs; this session never carries the API key.
         self._download_session = download_session
         self.storage_host = (storage_host or os.environ.get("CANDLEFEED_L2_STORAGE_HOST")
@@ -278,6 +287,14 @@ class CandleFeed:
         # requested exchange/symbol/interval) and ``source`` (native vs
         # resampled). Also attached to each returned frame as ``df.attrs["meta"]``.
         self.last_meta: Dict[str, Any] = {}
+
+    def _known_keys(self) -> List[str]:
+        """Every key this client could send: its own and any X-API-Key on the API or download session."""
+        keys = [self.api_key] if self.api_key else []
+        for name in ("_session", "_download_session"):
+            headers = getattr(getattr(self, name, None), "headers", None) or {}
+            keys += [v for k, v in headers.items() if str(k).lower() == "x-api-key" and isinstance(v, str) and v]
+        return sorted(set(keys), key=len, reverse=True)
 
     def __repr__(self) -> str:
         # Redact the secret — keep only the non-sensitive environment marker
@@ -329,7 +346,8 @@ class CandleFeed:
                                           code="request_deadline")
             try:
                 # Never follow redirects: requests would carry the X-API-Key header to the new origin.
-                resp = _get_capped(self._session, url, clean, self._timeouts(url), _MAX_API_BODY, url, check)
+                resp = _get_capped(self._session, url, clean, self._timeouts(url), _MAX_API_BODY, url, check,
+                                   headers={"X-API-Key": None} if self.public else None)
             except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
                 check()
                 if attempt < self.max_retries:
@@ -975,6 +993,36 @@ class CandleFeed:
 
         Returns ``{"downloaded": [paths], "skipped": [paths], "missing": [...], "bytes": n}``.
         """
+        return self._download_l2(dataset, symbol, start, end, dest_dir, verify, max_bytes, max_file_bytes, deadline)
+
+    @_no_key_in_errors
+    def l2_sample(self, symbol: Optional[str] = None, date: Union[str, date, None] = None,
+                  dataset: Optional[str] = None) -> Dict[str, Any]:
+        """The no-account sample: without arguments, the sample days on offer (``samples``); with a symbol and
+        date, that day's listing with 15-minute links, shaped like :meth:`l2_files`. Works on a
+        ``CandleFeed(public=True)`` client. The server limits listings and bytes per address."""
+        if dataset is not None and dataset not in L2_DATASETS:
+            raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
+        day = _to_day(date) if date is not None else None
+        return self._request("l2/sample", {"dataset": dataset, "symbol": symbol.upper() if symbol else None,
+                                           "date": day.isoformat() if day else None})
+
+    @_no_key_in_errors
+    def download_l2_sample(self, symbol: str, date: Union[str, date, datetime], dest_dir: Union[str, os.PathLike],
+                           dataset: str = "book", verify: bool = True, max_file_bytes: int = _L2_MAX_FILE_BYTES,
+                           deadline: Optional[float] = None) -> Dict[str, Any]:
+        """Download one no-account sample day, no API key needed::
+
+            CandleFeed(public=True).download_l2_sample("BTCUSDT", "2026-10-01", "data/")
+
+        Same layout, checks and return value as :meth:`download_l2` (size and SHA-256 before the rename into
+        place, resume, refreshed links). Call ``l2_sample()`` for the days on offer."""
+        day = _to_day(date)
+        return self._download_l2(dataset, symbol, day, day, dest_dir, verify, None, max_file_bytes, deadline,
+                                 lister=lambda first, last: self.l2_sample(symbol, first, dataset))
+
+    def _download_l2(self, dataset, symbol, start, end, dest_dir, verify, max_bytes, max_file_bytes, deadline,
+                     lister=None):
         if dataset not in L2_DATASETS:
             raise InvalidParameterError(f"dataset must be one of {L2_DATASETS}", code="invalid_parameter")
         symbol = symbol.upper()
@@ -984,6 +1032,7 @@ class CandleFeed:
         last = _to_day(end) if end is not None else first
         if first is None or last is None or last < first:
             raise InvalidParameterError("end must be on or after start", code="invalid_parameter")
+        lister = lister or (lambda f, to: self.l2_files(dataset, symbol, f, to))
         if not _safefs.DIR_FD:
             raise CandleFeedError(
                 "download_l2 needs directory-relative, no-follow file operations (dir_fd and O_NOFOLLOW) to keep "
@@ -997,7 +1046,8 @@ class CandleFeed:
             window = first
             while window <= last:
                 window_end = min(window + timedelta(days=_L2_MAX_DAYS_PER_CALL - 1), last)
-                self._download_l2_window(dataset, symbol, window, window_end, Path(dest_dir), verify, result, limits)
+                self._download_l2_window(dataset, symbol, window, window_end, Path(dest_dir), verify, result, limits,
+                                         lister)
                 window = window_end + timedelta(days=1)
         finally:
             self._deadline_at = None
@@ -1046,8 +1096,8 @@ class CandleFeed:
         except UnsafePath as exc:
             raise CandleFeedError(f"Refusing to write {f['name']} for {day}: {exc}") from None
 
-    def _download_l2_window(self, dataset, symbol, first, last, dest_dir: Path, verify, result, limits):
-        listing = self.l2_files(dataset, symbol, first, last)
+    def _download_l2_window(self, dataset, symbol, first, last, dest_dir: Path, verify, result, limits, lister):
+        listing = lister(first, last)
         days = self._check_l2_listing(listing, dataset, first, last, limits["max_file_bytes"])
         # One decision per file, made once: a file counts as cached only if it's a plain file with the listed
         # size and (with verify) hash. The same decision drives the budget check and the skip below, so a
@@ -1074,7 +1124,7 @@ class CandleFeed:
 
         def refresh(from_day: str) -> None:
             self._check_deadline(limits["deadline_at"], "a fresh listing")
-            fresh = listing if not urls else self.l2_files(dataset, symbol, from_day, last)
+            fresh = listing if not urls else lister(from_day, last)
             fresh_days = self._check_l2_listing(fresh, dataset, date.fromisoformat(from_day), last,
                                                 limits["max_file_bytes"])
             urls.update({f["key"]: self._checked_download_url(f["url"]) for d in fresh_days for f in d["files"]})
@@ -1198,9 +1248,10 @@ class CandleFeed:
                     self._sleep(self._backoff(attempt - 1), f["name"])
                 self._check_deadline(deadline_at, f["name"])
                 try:
-                    # Spaces serves the Parquet files as they are: no HTTP compression, every read is file bytes
+                    # Spaces serves the Parquet files as they are: no HTTP compression, every read is file bytes.
+                    # Storage never needs the API key: drop one inherited from a shared session, per request.
                     resp = self._download_session.get(urls[f["key"]], stream=True,
-                                                      headers={"Accept-Encoding": "identity"},
+                                                      headers={"Accept-Encoding": "identity", "X-API-Key": None},
                                                       timeout=self._timeouts(f["name"]), allow_redirects=False)
                 except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
                     self._check_deadline(deadline_at, f["name"])

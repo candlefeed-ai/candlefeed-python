@@ -52,9 +52,10 @@ class FakeSession:
         self._handler = fn
 
     def get(self, url: str, params: Optional[dict] = None, timeout: float = 0,
-            allow_redirects: bool = True, stream: bool = False) -> FakeResponse:
+            allow_redirects: bool = True, stream: bool = False, headers: Optional[dict] = None) -> FakeResponse:
         params = params or {}
-        self.calls.append({"url": url, "params": params, "allow_redirects": allow_redirects, "stream": stream})
+        self.calls.append({"url": url, "params": params, "allow_redirects": allow_redirects, "stream": stream,
+                           "headers": headers})
         if self._handler is not None:
             return self._handler(url, params)
         if not self._queue:

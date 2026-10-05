@@ -42,7 +42,7 @@ class FakeStorage:
 
     def get(self, url: str, stream: bool = False, timeout: float = 0, allow_redirects: bool = True,
             headers=None) -> FakeStream:
-        assert stream and allow_redirects is False and headers == {"Accept-Encoding": "identity"}
+        assert stream and allow_redirects is False and headers == {"Accept-Encoding": "identity", "X-API-Key": None}
         self.calls.append(url)
         self.timeouts.append(timeout)
         queue = self.script[url.split("?")[0]]
@@ -702,3 +702,65 @@ def test_api_calls_outside_download_l2_are_capped_too(cf, fake_session, monkeypa
     with pytest.raises(CandleFeedError, match="over 10,000 bytes"):
         cf.l2_files("book", "BTCUSDT", "2026-09-01")
     assert fake_session.calls[-1]["stream"] is True
+
+
+# ------------------------------------------------------------------ no-account sample
+
+@pytest.fixture
+def public_cf(fake_session, storage, monkeypatch) -> CandleFeed:
+    monkeypatch.setenv("CANDLEFEED_API_KEY", "cf_live_should_never_be_sent")
+    c = CandleFeed(public=True, session=fake_session, download_session=storage, storage_host="sgp1.example")
+    monkeypatch.setattr(client_module.time, "sleep", lambda s: fake_session.sleeps.append(s))
+    return c
+
+
+def test_a_public_client_sends_no_key_even_with_one_in_the_environment(public_cf, fake_session):
+    assert public_cf.api_key is None and "X-API-Key" not in fake_session.headers
+    assert "unset" in repr(public_cf)
+    fake_session.queue(FakeResponse(200, {"status": "ok", "samples": []}))
+    public_cf.l2_sample()
+    assert fake_session.calls[0]["url"].endswith("/l2/sample") and fake_session.calls[0]["params"] == {}
+
+
+def test_without_public_a_missing_key_still_raises(monkeypatch):
+    monkeypatch.delenv("CANDLEFEED_API_KEY", raising=False)
+    with pytest.raises(client_module.AuthenticationError):
+        CandleFeed()
+
+
+def test_sample_download_needs_no_key_and_checks_like_download_l2(public_cf, fake_session, storage, tmp_path):
+    day = _day("2026-10-01")
+    fake_session.queue(_listing([day]))
+    _serve(storage, day, [BODY_A, BODY_M])
+    out = public_cf.download_l2_sample("btcusdt", "2026-10-01", tmp_path)
+    target = tmp_path / "book" / "binance" / "BTCUSDT" / "2026-10-01"
+    assert (target / "depth" / "00.parquet").read_bytes() == BODY_A and (target / "manifest.json").read_bytes() == BODY_M
+    assert out["bytes"] == len(BODY_A) + len(BODY_M) and len(out["downloaded"]) == 2
+    assert fake_session.calls[0]["params"] == {"symbol": "BTCUSDT", "date": "2026-10-01", "dataset": "book"}
+    assert "X-API-Key" not in fake_session.headers and "X-API-Key" not in storage.headers
+    assert not list(target.rglob("*.part"))
+
+
+def test_sample_download_refuses_a_bad_hash_and_refreshes_through_the_sample_endpoint(public_cf, fake_session,
+                                                                                       storage, tmp_path):
+    bad = _day("2026-10-01")
+    fake_session.queue(_listing([bad]))
+    storage.script[bad["files"][0]["url"].split("?")[0]] = [FakeStream(200, b"z" * len(BODY_A))]
+    with pytest.raises(CandleFeedError, match="SHA-256 mismatch"):
+        public_cf.download_l2_sample("BTCUSDT", "2026-10-01", tmp_path)
+    assert not list(tmp_path.rglob("*.part"))
+
+    old, new = _day("2026-10-01", gen="g1"), _day("2026-10-01", gen="g1")
+    for f in new["files"]:
+        f["url"] = f["url"].replace("Signature=g1", "Signature=fresh")
+    fake_session.queue(_listing([old]), _listing([new]))
+    storage.script[old["files"][0]["url"].split("?")[0]] = [FakeStream(403), FakeStream(200, BODY_A)]
+    storage.script[old["files"][1]["url"].split("?")[0]] = [FakeStream(200, BODY_M)]
+    public_cf.download_l2_sample("BTCUSDT", "2026-10-01", tmp_path)
+    assert [c["url"].rsplit("/", 1)[1] for c in fake_session.calls[1:]] == ["sample", "sample"]
+
+
+def test_sample_listing_for_another_day_is_refused(public_cf, fake_session, storage, tmp_path):
+    fake_session.queue(_listing([_day("2026-09-01")]))
+    with pytest.raises(CandleFeedError, match="Unexpected day"):
+        public_cf.download_l2_sample("BTCUSDT", "2026-10-01", tmp_path)
