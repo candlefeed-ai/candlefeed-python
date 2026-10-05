@@ -5,6 +5,8 @@ import contextlib
 import importlib.util
 import io
 import random
+import re
+import subprocess
 import sys
 from collections import Counter
 from decimal import Decimal
@@ -15,7 +17,7 @@ import pandas as pd
 import pytest
 from l2_synth import SCALE, classify, day_ms, make_day, ticks, write_day
 
-from candlefeed.l2book import BookUnavailable, L2Book
+from candlefeed.l2book import BookUnavailable, IncompleteDay, L2Book
 
 DAY = "2026-09-01"
 
@@ -218,85 +220,227 @@ def test_out_of_range_and_bad_input(broken_day, tmp_path):
         L2Book.load(root, "BTCUSDT", "2026-09-01", "2026-09-02")
 
 
-# The worked example from the published docs (website/candlefeed-l2-docs.md, "Worked example"),
-# unchanged except for DAY. Its hourly output must match book_at at each hour's end.
-DOCS_EXAMPLE = '''
-import pyarrow.parquet as pq
-
-DAY = "data/book/binance/BTCUSDT/2026-09-25"   # the folder download_l2 wrote for that day
-
-# Snapshots are one row per price level. Group them into books by lastUpdateId,
-# skipping any that landed inside a gap.
-snap = pq.read_table(f"{DAY}/snapshot.parquet").to_pandas()
-snap = snap[snap["anchor_class"] != "in_gap"]
-anchors = []
-for last_update_id, rows in snap.groupby("final_update_id", sort=True):
-    rows = rows[rows["recv_time"] == rows["recv_time"].min()]  # one node's copy
-    book = {"bid": {}, "ask": {}}
-    for side, price, qty in zip(rows["side"], rows["price"], rows["qty"]):
-        book[side][price] = qty
-    anchors.append((last_update_id, book))
-
-book = None      # no usable book until a snapshot anchors it
-segment = None   # segment of the previous event
-last_u = -1      # u of the previous event
-k = 0            # next snapshot to try
-cols = ["final_update_id", "segment", "side", "price", "qty"]
-
-for hour in range(24):
-    f = pq.ParquetFile(f"{DAY}/depth/{hour:02d}.parquet")
-    for batch in f.iter_batches(batch_size=500_000, columns=cols):
-        for u, seg, side, price, qty in zip(*(c.to_pylist() for c in batch.columns)):
-            if u != last_u:                 # first row of a new event
-                if seg != segment:          # chain broke: the old book is stale
-                    book, segment = None, seg
-                if book is None:
-                    while k < len(anchors) and anchors[k][0] <= last_u:
-                        k += 1
-                    # This is the first event with u >= lastUpdateId. If the
-                    # snapshot's id falls inside this event, still apply it whole.
-                    if k < len(anchors) and anchors[k][0] <= u:
-                        book = {s: dict(lv) for s, lv in anchors[k][1].items()}
-                last_u = u
-            if book is not None:
-                if qty == 0:
-                    book[side].pop(price, None)
-                else:
-                    book[side][price] = qty
-    if book:
-        print(f"{hour:02d}:59 UTC  bid {max(book['bid'])}  ask {min(book['ask'])}")
-'''
+REPO = Path(__file__).resolve().parents[3]
+REPLAY_DOCS = ["website/candlefeed-l2-docs.md", "website/public/llms-full.txt"]
+REPLAY_DAY = '"data/book/binance/BTCUSDT/2026-09-25"'
+PRE_PR132 = "b8f649661fdc771e70c16884da82521f6a38a4aa"   # the examples before the chain-break fix
 
 
-def test_published_worked_example_agrees_hour_by_hour(broken_day):
-    root, ddir, truth = broken_day
-    code = DOCS_EXAMPLE.replace('"data/book/binance/BTCUSDT/2026-09-25"', repr(str(ddir)))
+def _replay_example(rel, revision=None):
+    """The reference replay as published, read from the doc itself so the test can't drift from it."""
+    if revision is None:
+        text = (REPO / rel).read_text()
+    else:
+        try:
+            text = subprocess.run(["git", "show", f"{revision}:{rel}"], cwd=REPO, text=True,
+                                  capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip(f"{revision[:7]} isn't in this checkout")
+    blocks = [b for b in re.findall(r"```python\n(.*?)```", text, re.S) if "anchors.append" in b]
+    assert len(blocks) == 1, rel
+    return blocks[0]
+
+
+def _run_replay(rel, ddir, revision=None):
+    code = _replay_example(rel, revision)
+    assert code.count(REPLAY_DAY) == 1, rel
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        exec(compile(code, "docs_example", "exec"), {})
-    lines = out.getvalue().splitlines()
+        exec(compile(code.replace(REPLAY_DAY, repr(str(ddir))), rel, "exec"), {})
+    return out.getvalue().splitlines()
+
+
+def _parse_line(line):
+    label = line.split(" UTC")[0]
+    t = pd.Timestamp(f"{DAY} {label}", tz="UTC")
+    if len(label) == 5:     # a bare hh:mm label claims the book at the end of that minute
+        t += pd.Timedelta(minutes=1) - pd.Timedelta(milliseconds=1)
+    bid = Decimal(line.split("bid ")[1].split()[0])
+    ask = Decimal(line.split("ask ")[1].split()[0])
+    return t, float(bid), float(ask)
+
+
+def _assert_lines_match_book_at(lines, book):
+    for line in lines:
+        t, bid, ask = _parse_line(line)
+        # book_at raises BookUnavailable for a moment inside a break, which is the case this guards against
+        view = book.book_at(t)
+        assert (view.best_bid, view.best_ask) == (bid, ask), line
+
+
+def test_both_published_replays_are_the_same_code():
+    a, b = (_replay_example(rel) for rel in REPLAY_DOCS)
+    assert a == b
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_published_worked_example_agrees_with_book_at_and_never_reports_inside_a_break(broken_day, rel):
+    root, ddir, truth = broken_day
+    lines = _run_replay(rel, ddir)
     assert len(lines) >= 22
     book = L2Book([ddir])
-    declined = []
-    for line in lines:
-        hh = int(line[:2])
-        bid = Decimal(line.split("bid ")[1].split()[0])
-        ask = Decimal(line.split("ask ")[1].split()[0])
-        t = pd.Timestamp(DAY, tz="UTC") + pd.Timedelta(hours=hh + 1) - pd.Timedelta(milliseconds=1)
-        try:
-            view = book.book_at(t)
-        except BookUnavailable as exc:
-            # The example prints the last book even when a break has already begun; the library
-            # declines. Both agree on the book as of the last event before the break.
-            # The tail after the day's last event is declined the same way.
-            kind = "break" if "break in the update chain" in str(exc) else "tail"
-            assert kind == "break" or "after the last event" in str(exc)
-            seg = book.segments()
-            last = seg.loc[seg["last_event"] <= t, "last_event"].max()
-            view = book.book_at(last)
-            declined.append(kind)
-        assert (view.best_bid, view.best_ask) == (float(bid), float(ask)), line
-    assert sorted(declined) == ["break", "tail"]     # the 16:59 drop, and 23:59 after the last event
+    breaks = book.segments()["last_event"].iloc[:-1]
+    _assert_lines_match_book_at(lines, book)
+    # the 16:00 hour ends inside the drop at event 1699: its line is the book as of the last event before it
+    assert any(_parse_line(line)[0] in set(breaks) for line in lines)
+
+
+def _first_snapshot(t0, bids=((9999, Decimal(1)), (9998, Decimal(1)))):
+    return ("tokyo", 101, t0 + 1000, (t0 + 1000) * 10**6, list(bids), [(10001, Decimal(1))])
+
+
+def _hourly_events(t0, hours=range(24)):
+    """One event a second into each listed hour, ids 101, 102, ... in that order."""
+    return [(t0 + h * 3_600_000 + 1000, 101 + i, 101 + i, 100 + i, [("ask", 10001, Decimal(1))])
+            for i, h in enumerate(hours)]
+
+
+def _shift(events, by):
+    return [(t, U + by, u + by, pu + by, rows) for t, U, u, pu, rows in events]
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_original_example_is_rejected_at_chain_break(tmp_path, rel, monkeypatch):
+    """Control: the examples as they were before this fix fail the printed-time oracle."""
+    old = _replay_example(rel, PRE_PR132)
+    ddir, _, _ = make_day(tmp_path, DAY, seed=7, drops=[(530, 6), (1699, 3)], resets=[1110])
+    monkeypatch.setattr(sys.modules[__name__], "_replay_example", lambda rel, revision=None: old)
+    with pytest.raises(BookUnavailable, match="break in the update chain"):
+        test_published_worked_example_agrees_with_book_at_and_never_reports_inside_a_break(
+            (tmp_path, ddir, None), rel)
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_replay_accepts_hours_the_manifest_omits(tmp_path, rel):
+    """A partial day starting at 05:00 and an empty 09:00 hour: neither file exists, and that's fine."""
+    t0 = day_ms(DAY)
+    hours = [h for h in range(5, 24) if h != 9]
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", _hourly_events(t0, hours), [_first_snapshot(t0 + 5 * 3_600_000)])
+    assert not (ddir / "depth/00.parquet").exists() and not (ddir / "depth/09.parquet").exists()
+    lines = _run_replay(rel, ddir)
+    assert [_parse_line(line)[0].hour for line in lines] == hours
+    _assert_lines_match_book_at(lines, L2Book([ddir]))
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_missing_manifest_listed_hour_is_rejected(tmp_path, rel):
+    """Skipping a lost download must not silently carry a stale best bid forward."""
+    t0 = day_ms(DAY)
+    events = _hourly_events(t0)
+    events[1] = (*events[1][:4], [("bid", 9999, Decimal(0))])
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, [_first_snapshot(t0)])
+    assert L2Book([ddir]).book_at(events[2][0]).best_bid == 999.8
+    (ddir / "depth/01.parquet").unlink()
+    with pytest.raises(IncompleteDay, match="listed in the manifest but missing"):
+        L2Book([ddir])
+    code = _replay_example(rel).replace(REPLAY_DAY, repr(str(ddir)))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), pytest.raises(FileNotFoundError, match="manifest.json.*01.parquet"):
+        exec(compile(code, rel, "exec"), {})
+    assert out.getvalue() == ""     # it stops before printing anything, not partway through the day
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_backward_event_time_labels_the_book_with_the_latest_time(tmp_path, rel):
+    """Ids rise but E goes 1000, 3000, 2000: book_at(2000) hasn't applied the 3000 event yet."""
+    t0 = day_ms(DAY)
+    events = [
+        (t0 + 1000, 101, 101, 100, [("ask", 10001, Decimal(1))]),
+        (t0 + 3000, 102, 102, 101, [("bid", 10000, Decimal(1))]),
+        (t0 + 2000, 103, 103, 102, [("bid", 10000, Decimal(2))]),
+    ] + _shift(_hourly_events(t0)[1:], 2)
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, [_first_snapshot(t0)])
+    lines = _run_replay(rel, ddir)
+    assert len(lines) == 24
+    assert lines[0].startswith("00:00:03.000 UTC  bid 1000.0")
+    _assert_lines_match_book_at(lines, L2Book([ddir]))
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_backward_event_time_at_end_of_data_prints_nothing_for_that_hour(tmp_path, rel):
+    """The day's last event is earlier than the one before it: book_at has no book at the later time."""
+    t0, t23 = day_ms(DAY), day_ms(DAY) + 23 * 3_600_000
+    events = _hourly_events(t0, range(23)) + [
+        (t23 + 3000, 124, 124, 123, [("bid", 9997, Decimal(1))]),
+        (t23 + 2000, 125, 125, 124, [("bid", 10000, Decimal(1))]),
+    ]
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, [_first_snapshot(t0)])
+    book = L2Book([ddir])
+    with pytest.raises(BookUnavailable, match="after the last event"):
+        book.book_at(pd.Timestamp(t23 + 3000, unit="ms", tz="UTC"))
+    lines = _run_replay(rel, ddir)
+    assert [_parse_line(line)[0].hour for line in lines] == list(range(23))
+    _assert_lines_match_book_at(lines, book)
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_backward_event_time_before_a_break_prints_nothing_for_that_hour(tmp_path, rel):
+    t0, t5 = day_ms(DAY), day_ms(DAY) + 5 * 3_600_000
+    events = _hourly_events(t0, range(5)) + [
+        (t5 + 3000, 106, 106, 105, [("bid", 9997, Decimal(1))]),
+        (t5 + 2000, 107, 107, 106, [("bid", 10000, Decimal(1))]),
+    ] + _shift(_hourly_events(t0, range(6, 24)), 1000)      # pu jumps: the chain breaks before 06:00
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, [_first_snapshot(t0)])
+    book = L2Book([ddir])
+    with pytest.raises(BookUnavailable, match="break in the update chain"):
+        book.book_at(pd.Timestamp(t5 + 3000, unit="ms", tz="UTC"))
+    lines = _run_replay(rel, ddir)
+    assert [_parse_line(line)[0].hour for line in lines] == list(range(5))
+    _assert_lines_match_book_at(lines, book)
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_milliseconds_and_last_event_of_each_hour_are_exact(tmp_path, rel):
+    t0 = day_ms(DAY)
+    events = [(t - 1000 + 3_599_999, U, u, pu, rows) for t, U, u, pu, rows in _hourly_events(t0)]
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, [_first_snapshot(t0)])
+    lines = _run_replay(rel, ddir)
+    assert [_parse_line(line)[0].value // 1_000_000 for line in lines] == [e[0] for e in events]
+    _assert_lines_match_book_at(lines, L2Book([ddir]))
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_exhausted_snapshot_window_is_a_documented_limitation(tmp_path, rel):
+    """Every bid in a 1,000-level snapshot is deleted and one appears below it. The true best bid is
+    unknown: book_at says so, and the example (which doesn't track the window) must say in its prose
+    that it doesn't detect this and point to L2Book."""
+    t0 = day_ms(DAY)
+    events = _hourly_events(t0)
+    events[1] = (*events[1][:4], [("bid", p, Decimal(0)) for p in range(9000, 10000)]
+                 + [("bid", 8990, Decimal(1))])
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events,
+                     [_first_snapshot(t0, [(p, Decimal(1)) for p in range(9000, 10000)])])
+    book = L2Book([ddir])
+    assert book.book_at(events[1][0]).best_bid is None
+    lines = _run_replay(rel, ddir)
+    _assert_lines_match_book_at(lines[:1], book)          # before the window runs out they agree
+    text = (REPO / rel).read_text()
+    prose = text[:text.index(_replay_example(rel))].rsplit("```", 1)[0][-1500:]
+    assert "1,000 levels a side" in prose and "past the edge of that window" in prose
+    assert "`candlefeed.l2book.L2Book`" in prose and "None" in prose
+
+
+@pytest.mark.parametrize("rel", REPLAY_DOCS)
+def test_reset_at_hour_boundary_waits_for_straddle_anchor(tmp_path, rel):
+    t0 = day_ms(DAY)
+    events = [
+        (t0 + 1000, 101, 101, 100, [("ask", 10001, Decimal(1))]),
+        (t0 + 3_600_000 + 1000, 210, 210, -1, [("bid", 9999, Decimal(0))]),
+        (t0 + 7_200_000 + 1000, 211, 212, 210, [("bid", 9998, Decimal(2)), ("ask", 10001, Decimal(0))]),
+    ] + _shift(_hourly_events(t0)[3:], 109)
+    snapshots = [_first_snapshot(t0),
+                 ("tokyo", 205, t0 + 3_600_000, (t0 + 3_600_000) * 10**6,
+                  [(9999, Decimal(1))], [(10001, Decimal(1))]),
+                 ("tokyo", 211, t0 + 7_200_000 + 1000, (t0 + 7_200_000 + 1000) * 10**6,
+                  [(9998, Decimal(2))], [(10001, Decimal(1)), (10002, Decimal(1))])]
+    ddir = write_day(tmp_path, DAY, "BTCUSDT", events, snapshots)
+    book = L2Book([ddir])
+    assert book.skipped_snapshots == 1
+    lines = _run_replay(rel, ddir)
+    assert len(lines) == 23
+    assert not any(line.startswith("01:") for line in lines)
+    assert _parse_line(lines[1])[1:] == (999.8, 1000.2)
+    _assert_lines_match_book_at(lines, book)
 
 
 def test_classification_matches_the_reconcile_job(broken_day):
