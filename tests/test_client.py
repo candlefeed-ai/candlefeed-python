@@ -27,6 +27,14 @@ def test_api_key_required(monkeypatch):
         CandleFeed()
 
 
+def test_missing_key_error_links_to_signup(monkeypatch):
+    monkeypatch.delenv("CANDLEFEED_API_KEY", raising=False)
+    with pytest.raises(AuthenticationError) as ei:
+        CandleFeed()
+    assert "https://candlefeed.ai/signup?utm_source=client&utm_medium=error" in str(ei.value)
+    assert "no card" in str(ei.value) and "about a minute" in str(ei.value)
+
+
 def test_api_key_from_env(monkeypatch):
     monkeypatch.setenv("CANDLEFEED_API_KEY", "cf_live_fromenv")
     cf = CandleFeed()

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.1
+
+- The README says how to get a key before the first code example, with a link to the free signup page.
+- The no-key `AuthenticationError` now points to https://candlefeed.ai/signup instead of the homepage,
+  and says the free key needs no card and takes about a minute.
+- New `request_deadline` (default 60 s, `None` to turn off): an elapsed-time budget for one attempt at an
+  API request, checked after every read of the answer, at its end and before any network error is passed
+  on, so a request that's out of time always reports `CandleFeedError` with code `request_deadline`, and
+  isn't retried. It's checked between reads: a server that stalls inside a single read (slow response
+  headers, endless chunk trailers, a slow proxy CONNECT) is bounded by the socket read timeout
+  (`timeout`), not by a hard wall clock. It's per attempt: 429 retries
+  start a fresh one, and backoff waits aren't counted. A valid 50,000-row page over a link slower than about
+  0.7 Mbit/s needs a larger value or `None`.
+- New `candlefeed.client.bounded_get()`: the same capped, deadline-bound GET for callers with their own
+  session (the MCP server uses it for the public endpoints). It always sends `Accept-Encoding: gzip,
+  deflate`, overriding the session's default, which can offer br or zstd that the reader refuses.
+- candlefeed.ai links in the README carry UTM tags so signups from PyPI and GitHub can be counted.
+
+Fixes from Astra's full review of 0.3.0:
+
+- Error messages and codes no longer repeat the client's own API key if the API echoes it back. This covers
+  JSON and non-JSON error bodies, retry-exhausted errors and everything raised from `download_l2`.
+- Every API response is now read through the 64 MiB capped reader, not only listings inside `download_l2`.
+- `L2Book` documents that an instance isn't thread-safe: queries share a cursor and the row cache.
+- `examples/funding_carry_backtest.ipynb`: the aggregated funding rate is per hour
+  (`funding_rate_basis="per_hour"`), so it's now annualised with 24 hours a day instead of 3 settlements,
+  which understated carry 8x. Cumulative carry now sums each settlement as the hourly rate times 8 (the
+  basket's stated 8-hour cadence) instead of forward-filling, the text and labels say so, and the stale
+  stored outputs of those cells were cleared.
+- Download deadlines are checked the same way: after every read, at the end of each file and before a
+  network error leads to a retry, so running out of time always reports `download_deadline`.
+- A downloaded file is committed (renamed from `.part`) only if it arrived before the deadline with the
+  listed size and SHA-256. The hash is computed while streaming, so it's checked even with `verify=False`
+  (which now only skips re-hashing files already on disk). Anything else deletes the `.part` file.
+- Bodies are decoded by the client (gzip and deflate), bounded by what's left of the size cap, and the
+  compressed input is capped too. API requests ask for gzip or deflate only; other encodings are refused.
+  L2 files are requested with `Accept-Encoding: identity`, and a compressed file response is refused.
+- Works with urllib3 1.26 as well as 2.x: without `HTTPResponse.read1()` the reader falls back to
+  `read(8 KiB)`, so there the deadline is checked per 8 KiB received.
+- `download_l2`'s deadline is kept per thread, so concurrent requests on one client don't share it.
+- Error messages and codes are taken from the API's error JSON only when they're strings. Objects or lists
+  in those fields are replaced by the generic message, so a key nested inside them can't reach the exception.
+
 ## 0.3.0
 
 Order book rebuild.

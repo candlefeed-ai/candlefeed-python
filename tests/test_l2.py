@@ -40,8 +40,9 @@ class FakeStorage:
         self.script: Dict[str, list] = {}
         self.timeouts: list = []
 
-    def get(self, url: str, stream: bool = False, timeout: float = 0, allow_redirects: bool = True) -> FakeStream:
-        assert stream and allow_redirects is False
+    def get(self, url: str, stream: bool = False, timeout: float = 0, allow_redirects: bool = True,
+            headers=None) -> FakeStream:
+        assert stream and allow_redirects is False and headers == {"Accept-Encoding": "identity"}
         self.calls.append(url)
         self.timeouts.append(timeout)
         queue = self.script[url.split("?")[0]]
@@ -199,7 +200,7 @@ def test_network_errors_never_carry_the_presigned_query(cf, fake_session, storag
 
 
 def test_api_request_errors_are_sanitised_and_unchained(cf, fake_session, monkeypatch):
-    def fail(url, params=None, timeout=0, allow_redirects=True):
+    def fail(url, params=None, timeout=0, allow_redirects=True, stream=False):
         raise requests.ConnectionError(f"Max retries exceeded with url: {url}?token=abc123")
 
     monkeypatch.setattr(fake_session, "get", fail)
@@ -576,6 +577,9 @@ class _Body(io.BytesIO):
             raise urllib3.exceptions.ReadTimeoutError(None, "https://sgp1.example/x", "Read timed out.")
         return super().read(amt)
 
+    def read1(self, amt=-1):
+        return self.read(amt)
+
 
 def _real(body: _Body, headers=None, status=200) -> requests.Response:
     raw = urllib3.HTTPResponse(body=body, headers=headers or {}, status=status, preload_content=False,
@@ -586,15 +590,17 @@ def _real(body: _Body, headers=None, status=200) -> requests.Response:
     return resp
 
 
-def test_gzip_content_encoding_is_decoded_before_size_and_hash_checks(cf, fake_session, storage, tmp_path):
-    """Astra recheck-3 #3: the raw read1 path handed compressed wire bytes to the size and hash checks."""
+def test_a_compressed_file_download_is_refused(cf, fake_session, storage, tmp_path):
+    """Files are requested with Accept-Encoding: identity. Compressed wire bytes would never reach the size and
+    hash checks as file bytes, and a gzip comment can stall the decoder, so anything else is refused."""
     day = _day()
     fake_session.queue(_listing([day]))
     a_url, m_url = (f["url"].split("?")[0] for f in day["files"])
     storage.script[a_url] = [_real(_Body(gzip.compress(BODY_A)), {"Content-Encoding": "gzip"})]
     storage.script[m_url] = [_real(_Body(BODY_M))]
-    cf.download_l2("book", "BTCUSDT", "2026-09-01", None, tmp_path)
-    assert (tmp_path / "book/binance/BTCUSDT/2026-09-01/depth/00.parquet").read_bytes() == BODY_A
+    with pytest.raises(CandleFeedError, match="Content-Encoding 'gzip'") as exc:
+        cf.download_l2("book", "BTCUSDT", "2026-09-01", None, tmp_path)
+    assert exc.value.code == "unsupported_encoding" and not list(tmp_path.rglob("*.part"))
 
 
 def test_urllib3_read_timeouts_are_retried_and_leave_no_part(cf, fake_session, storage, tmp_path):
@@ -612,7 +618,8 @@ def test_urllib3_read_timeouts_are_retried_and_leave_no_part(cf, fake_session, s
 def test_persistent_urllib3_errors_end_in_a_clean_failure(cf, fake_session, storage, tmp_path):
     day = _day()
     fake_session.queue(_listing([day]))
-    storage.script[day["files"][0]["url"].split("?")[0]] = [_real(_Body(BODY_A, fail_after=0))]
+    # a fresh response per attempt, as a real session gives
+    storage.script[day["files"][0]["url"].split("?")[0]] = [_real(_Body(BODY_A, fail_after=0)) for _ in range(5)]
     with pytest.raises(CandleFeedError, match="after 5 attempts: network error"):
         cf.download_l2("book", "BTCUSDT", "2026-09-01", None, tmp_path)
     assert not list(tmp_path.rglob("*.part"))
@@ -631,18 +638,16 @@ def test_a_deadline_hit_before_a_retry_removes_the_part(cf, fake_session, storag
     assert exc.value.code == "download_deadline" and not list(tmp_path.rglob("*.part"))
 
 
-def test_a_trickling_body_is_stopped_at_the_deadline_through_decoding(cf, fake_session, storage, tmp_path,
-                                                                      monkeypatch):
-    """Each 8 KiB chunk takes 25 s to arrive; with a 60 s deadline the download stops after the third chunk,
-    with gzip decoding in the path."""
+def test_a_trickling_body_is_stopped_at_the_deadline(cf, fake_session, storage, tmp_path, monkeypatch):
+    """Each 8 KiB chunk takes 25 s to arrive; with a 60 s deadline the download stops after the third chunk."""
     clock = [1000.0]
     monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
     big = bytes(range(256)) * 400                         # 102,400 bytes
     day = _day()
     day["files"][0].update(size=len(big), sha256=hashlib.sha256(big).hexdigest())
     fake_session.queue(_listing([day]))
-    body = _Body(gzip.compress(big, compresslevel=0), clock=clock, per_read=25)
-    storage.script[day["files"][0]["url"].split("?")[0]] = [_real(body, {"Content-Encoding": "gzip"})]
+    body = _Body(big, clock=clock, per_read=25)
+    storage.script[day["files"][0]["url"].split("?")[0]] = [_real(body)]
     with pytest.raises(CandleFeedError, match="deadline") as exc:
         cf.download_l2("book", "BTCUSDT", "2026-09-01", None, tmp_path, deadline=60)
     assert exc.value.code == "download_deadline" and body.reads <= 4
@@ -691,7 +696,9 @@ def test_an_oversized_refreshed_listing_is_refused(cf, fake_session, storage, tm
     assert len(fake_session.calls) == 2 and not list(tmp_path.rglob("*.part"))
 
 
-def test_outside_download_l2_api_calls_are_not_streamed(cf, fake_session):
-    fake_session.queue(FakeResponse(200, {"status": "ok", "days": []}))
-    cf.l2_files("book", "BTCUSDT", "2026-09-01")
-    assert fake_session.calls[-1]["stream"] is False
+def test_api_calls_outside_download_l2_are_capped_too(cf, fake_session, monkeypatch):
+    monkeypatch.setattr(client_module, "_MAX_API_BODY", 10_000)
+    fake_session.queue(FakeResponse(200, {"status": "ok", "days": [], "pad": "x" * 20_000}))
+    with pytest.raises(CandleFeedError, match="over 10,000 bytes"):
+        cf.l2_files("book", "BTCUSDT", "2026-09-01")
+    assert fake_session.calls[-1]["stream"] is True

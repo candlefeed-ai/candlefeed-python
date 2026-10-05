@@ -1,11 +1,14 @@
 """CandleFeed API client — pandas-native access to crypto market data."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
 import shutil
+import threading
 import time
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError as _PkgNotFound
 from importlib.metadata import version as _pkg_version
@@ -41,8 +44,10 @@ __all__ = [
 ]
 
 DEFAULT_BASE_URL = "https://candlefeed.ai/api/v1"
+SIGNUP_URL = "https://candlefeed.ai/signup?utm_source=client&utm_medium=error"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 4
+DEFAULT_REQUEST_DEADLINE = 60.0
 
 # Intervals the API accepts per dataset. Exposed for reference/validation in
 # calling code — the client itself does not reject unknown values, so a newly
@@ -90,6 +95,12 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _L2_DISK_HEADROOM = 64 * 1024 ** 2
 # Bodies are read in small chunks so the download deadline is checked often.
 _BODY_CHUNK = 8 * 1024
+_ACCEPT = "gzip, deflate"
+_ENCODINGS = {
+    "identity": None,
+    "gzip": lambda: zlib.decompressobj(16 + zlib.MAX_WBITS),
+    "deflate": lambda: zlib.decompressobj(zlib.MAX_WBITS),
+}
 _MAX_API_BODY = 64 * 1024 ** 2
 # The only files a day may contain; anything else in a listing is refused.
 _L2_FILE_NAMES = {
@@ -129,6 +140,68 @@ def _describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {message}"
 
 
+def _get_capped(session, url: str, params, timeout, limit: int, what: str, check, headers=None) -> requests.Response:
+    """One GET, redirects not followed, read in full: at most ``limit`` decoded bytes and ``check()`` (the
+    elapsed-time deadline) after every network read, at EOF and before any error is passed on, so a request
+    that's out of time always reports the deadline. The check runs between reads: a server that stalls inside
+    one read is bounded by the socket read timeout. Network errors propagate."""
+    try:
+        extra = {"headers": headers} if headers else {}
+        resp = session.get(url, params=params, timeout=timeout, allow_redirects=False, stream=True, **extra)
+        data = bytearray()
+        try:
+            for chunk in CandleFeed._body_chunks(resp, what, limit):
+                data += chunk
+                if len(data) > limit:
+                    raise CandleFeedError(f"Response from {what} is over {limit:,} bytes; stopped.",
+                                          code="response_too_large")
+                check()
+        finally:
+            resp.close()
+    except (CandleFeedError, requests.RequestException, urllib3.exceptions.HTTPError):
+        check()
+        raise
+    check()
+    resp._content = bytes(data)
+    resp._content_consumed = True
+    return resp
+
+
+def bounded_get(session: requests.Session, url: str, params: Optional[Dict[str, Any]] = None,
+                timeout: float = DEFAULT_TIMEOUT, deadline: Optional[float] = DEFAULT_REQUEST_DEADLINE,
+                max_bytes: int = _MAX_API_BODY) -> requests.Response:
+    """GET ``url`` without following redirects and read the whole answer, like the client's own requests: at
+    most ``max_bytes`` decoded bytes, with ``deadline`` seconds checked after every read and at the end.
+    Raises CandleFeedError (codes ``request_deadline``, ``response_too_large``, ``unsupported_encoding``);
+    network errors propagate as requests or urllib3 exceptions. The response's body is already read."""
+    deadline_at = None if deadline is None else time.monotonic() + deadline
+
+    def check() -> None:
+        if deadline_at is not None and time.monotonic() > deadline_at:
+            raise CandleFeedError(f"The answer from {url} took longer than {deadline:g} s; stopped.",
+                                  code="request_deadline")
+    # Explicit per request: requests' default also offers br and zstd when it can decode them, and those
+    # would be refused by _body_chunks.
+    return _get_capped(session, url, params, timeout, max_bytes, url, check, headers={"Accept-Encoding": _ACCEPT})
+
+
+def _no_key_in_errors(method):
+    """The API may echo the key back in an error; strip it from anything raised before it reaches the caller."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except CandleFeedError as exc:
+            key = self.api_key
+
+            def clean(v):
+                return v.replace(key, "***") if key and isinstance(v, str) else v
+            exc.message, exc.code = clean(exc.message), clean(exc.code)
+            exc.args = tuple(clean(a) for a in exc.args)
+            raise
+    return wrapper
+
+
 def _to_iso(value: TimeLike) -> Optional[str]:
     """Normalize a datetime/str to an ISO8601 string the API accepts."""
     if value is None:
@@ -153,6 +226,10 @@ class CandleFeed:
         base_url: API base URL. Defaults to production.
         timeout: Per-request timeout in seconds.
         max_retries: Max retry attempts on HTTP 429 / transient network errors.
+        request_deadline: Elapsed seconds allowed for one attempt at an API request (default 60), checked
+            after every read of the answer and at its end. ``timeout`` only bounds the wait between reads, so
+            a server sending a byte at a time could otherwise keep a request open indefinitely. A stall inside
+            a single read (slow headers, say) is bounded by ``timeout``, not by this. ``None`` turns it off.
         session: Optional pre-configured :class:`requests.Session`.
     """
 
@@ -165,24 +242,28 @@ class CandleFeed:
         session: Optional[requests.Session] = None,
         download_session: Optional[requests.Session] = None,
         storage_host: Optional[str] = None,
+        request_deadline: Optional[float] = DEFAULT_REQUEST_DEADLINE,
     ) -> None:
         key = api_key or os.environ.get("CANDLEFEED_API_KEY")
         if not key:
             raise AuthenticationError(
-                "No API key provided. Pass api_key= or set the "
-                "CANDLEFEED_API_KEY environment variable. Get a key at "
-                "https://candlefeed.ai",
+                "No API key provided. Pass api_key= or set CANDLEFEED_API_KEY. "
+                "Get a free key (no card, about a minute) at "
+                f"{SIGNUP_URL}",
                 code="unauthorized",
             )
         self.api_key = key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.request_deadline = request_deadline
+        self._local = threading.local()          # download_l2's deadline, per thread
         self._session = session or requests.Session()
         self._session.headers.update(
             {
                 "X-API-Key": self.api_key,
                 "Accept": "application/json",
+                "Accept-Encoding": _ACCEPT,                 # the encodings _body_chunks decodes itself
                 "User-Agent": f"candlefeed-python/{_CLIENT_VERSION}",
             }
         )
@@ -191,8 +272,7 @@ class CandleFeed:
         self.storage_host = (storage_host or os.environ.get("CANDLEFEED_L2_STORAGE_HOST")
                              or DEFAULT_L2_STORAGE_HOST).strip().lower()
         self.last_rate_limit: Dict[str, Optional[str]] = {}
-        self._deadline_at: Optional[float] = None
-        self._in_download = False
+        self._deadline_at = None
         # ``meta`` block from the most recent response — carries per-request
         # provenance such as ``history_from`` (earliest bucket available for the
         # requested exchange/symbol/interval) and ``source`` (native vs
@@ -208,6 +288,14 @@ class CandleFeed:
         masked = f"{prefix}***" if key else "unset"
         return f"CandleFeed(base_url={self.base_url!r}, api_key={masked!r})"
 
+    @property
+    def _deadline_at(self) -> Optional[float]:
+        return getattr(self._local, "deadline_at", None)
+
+    @_deadline_at.setter
+    def _deadline_at(self, value: Optional[float]) -> None:
+        self._local.deadline_at = value
+
     def close(self) -> None:
         """Close the underlying HTTP session."""
         self._session.close()
@@ -221,6 +309,7 @@ class CandleFeed:
     # ------------------------------------------------------------------ #
     # HTTP plumbing
     # ------------------------------------------------------------------ #
+    @_no_key_in_errors
     def _request(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Issue a single GET, map errors, and retry on 429/transient failures."""
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -228,17 +317,21 @@ class CandleFeed:
 
         attempt = 0
         while True:
+            request_deadline_at = (None if self.request_deadline is None
+                                   else time.monotonic() + self.request_deadline)
+            download_deadline_at = self._deadline_at
+
+            def check(download_at=download_deadline_at, request_at=request_deadline_at) -> None:
+                self._check_deadline(download_at, url)
+                if request_at is not None and time.monotonic() > request_at:
+                    raise CandleFeedError(f"The answer from {url} took longer than {self.request_deadline:g} s "
+                                          "(request_deadline); stopped. Try again, or ask for fewer rows.",
+                                          code="request_deadline")
             try:
                 # Never follow redirects: requests would carry the X-API-Key header to the new origin.
-                if not self._in_download:
-                    resp = self._session.get(url, params=clean, timeout=self._timeouts(url), allow_redirects=False)
-                else:
-                    # inside download_l2 every listing (refreshes too) streams through the capped reader, which
-                    # also checks the deadline when one is set
-                    resp = self._session.get(url, params=clean, timeout=self._timeouts(url), allow_redirects=False,
-                                             stream=True)
-                    self._read_api_body(resp, url)
-            except requests.RequestException as exc:
+                resp = _get_capped(self._session, url, clean, self._timeouts(url), _MAX_API_BODY, url, check)
+            except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                check()
                 if attempt < self.max_retries:
                     self._sleep(self._backoff(attempt), url)
                     attempt += 1
@@ -303,15 +396,14 @@ class CandleFeed:
         except ValueError:
             return None, resp.text or None
         # FastAPI wraps HTTPException detail under "detail"; our handlers also
-        # return the envelope at the top level. Support both.
+        # return the envelope at the top level. Support both. Only string fields are kept: anything else
+        # (objects, lists) could carry text the key scrub can't see, so it's replaced by the generic message.
         detail = body.get("detail") if isinstance(body, dict) else None
-        if isinstance(detail, dict):
-            return detail.get("code"), detail.get("message")
         if isinstance(detail, str):
             return None, detail
-        if isinstance(body, dict):
-            return body.get("code"), body.get("message")
-        return None, None
+        envelope = detail if isinstance(detail, dict) else body if isinstance(body, dict) else {}
+        code, message = envelope.get("code"), envelope.get("message")
+        return (code if isinstance(code, str) else None), (message if isinstance(message, str) else None)
 
     def _capture_rate_limit(self, resp: requests.Response) -> None:
         for header in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-Plan"):
@@ -849,6 +941,7 @@ class CandleFeed:
             "end": last.isoformat() if last else None,
         })
 
+    @_no_key_in_errors
     def download_l2(
         self,
         dataset: str,
@@ -864,9 +957,9 @@ class CandleFeed:
         """Download daily L2 files to ``dest_dir/<dataset>/binance/<SYMBOL>/<YYYY-MM-DD>/``.
 
         Ranges longer than 31 days are split into several calls. Each file streams to a ``.part``
-        file and is renamed into place only after its size (and, with ``verify=True``, its SHA-256)
-        matches what the API reported. Files already on disk with a matching hash are skipped, so a
-        rerun resumes. Network errors and 5xx responses are retried with backoff, and expired links
+        file and is renamed into place only after it arrived before the deadline with the size and SHA-256
+        the API reported; otherwise the ``.part`` file is deleted. Files already on disk with a matching
+        size (and, with ``verify=True``, hash) are skipped, so a rerun resumes. Network errors and 5xx responses are retried with backoff, and expired links
         are refreshed. Days the API can't serve are returned under ``missing``, not raised.
 
         Limits: the listing is refused if any file is bigger than ``max_file_bytes`` or the files still
@@ -900,7 +993,6 @@ class CandleFeed:
         limits = {"max_bytes": max_bytes, "max_file_bytes": max_file_bytes,
                   "deadline_at": None if deadline is None else time.monotonic() + deadline}
         self._deadline_at = limits["deadline_at"]
-        self._in_download = True
         try:
             window = first
             while window <= last:
@@ -909,7 +1001,6 @@ class CandleFeed:
                 window = window_end + timedelta(days=1)
         finally:
             self._deadline_at = None
-            self._in_download = False
         return result
 
     @staticmethod
@@ -1043,25 +1134,50 @@ class CandleFeed:
         time.sleep(seconds)
 
     @staticmethod
-    def _body_chunks(resp):
-        """The body in small chunks. iter_content applies the response's Content-Encoding and turns urllib3
-        errors into requests exceptions, which the retry logic handles."""
-        return resp.iter_content(chunk_size=_BODY_CHUNK)
+    def _body_chunks(resp, what: str, limit: int, identity_only: bool = False):
+        """The decoded body, one item per network read, at most ``limit`` + 1 decoded bytes in total.
 
-    def _read_api_body(self, resp, what: str) -> None:
-        """Read a streamed API response with the deadline checked after every chunk, then hand it back to
-        requests so .json() works as usual."""
-        data = bytearray()
-        try:
-            for chunk in self._body_chunks(resp):
-                data += chunk
-                if len(data) > _MAX_API_BODY:
-                    raise CandleFeedError(f"Response from {what} is over {_MAX_API_BODY:,} bytes; stopped.")
-                self._check_deadline(self._deadline_at, what)
-        finally:
-            resp.close()
-        resp._content = bytes(data)
-        resp._content_consumed = True
+        requests' own decoder keeps reading until a read decodes to something, so a gzip member with an
+        endless comment never hands control back and no deadline is checked. Here every read1() from the socket
+        yields (b"" when it decoded to nothing), compressed input is capped too, and decompression is bounded
+        by what's left of ``limit``. urllib3 errors pass through; callers retry on them."""
+        raw = getattr(resp, "raw", None)
+        if not isinstance(raw, urllib3.HTTPResponse):
+            yield from resp.iter_content(chunk_size=_BODY_CHUNK)     # test doubles without a real transport
+            return
+        encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+        if encoding not in _ENCODINGS or (identity_only and encoding != "identity"):
+            raise CandleFeedError(f"Response from {what} came with Content-Encoding {encoding[:40]!r}, which "
+                                  "the client doesn't accept here; stopped.", code="unsupported_encoding")
+        wire_limit = limit + limit // 100 + 65536            # gzip of incompressible data is slightly bigger
+        decoder = _ENCODINGS[encoding]() if _ENCODINGS[encoding] else None
+        wire = produced = 0
+        # read1 returns after one socket read. urllib3 1.26 doesn't have it; its read(amt) waits for amt bytes
+        # (8 KiB), so there the deadline is checked per 8 KiB, each read still bounded by the socket timeout.
+        read = getattr(raw, "read1", None) or raw.read
+        while True:
+            data = read(_BODY_CHUNK, decode_content=False)
+            if not data:
+                break
+            wire += len(data)
+            if wire > wire_limit:
+                raise CandleFeedError(f"Response from {what} is over {limit:,} bytes; stopped.")
+            if decoder is None:
+                out = data
+            else:
+                try:
+                    out = decoder.decompress(data, limit - produced + 1)
+                    while decoder.eof and decoder.unused_data and len(out) <= limit - produced:
+                        rest, decoder = decoder.unused_data, _ENCODINGS[encoding]()   # next gzip member
+                        out += decoder.decompress(rest, limit - produced - len(out) + 1)
+                except zlib.error as exc:
+                    raise CandleFeedError(f"Response from {what} isn't valid {encoding}: {exc}") from None
+            produced += len(out)
+            yield out
+            if produced > limit:
+                return
+        if decoder is not None and not decoder.eof:
+            raise CandleFeedError(f"Response from {what} ended in the middle of its {encoding} stream.")
 
     @staticmethod
     def _check_deadline(deadline_at: Optional[float], what: str) -> None:
@@ -1082,9 +1198,12 @@ class CandleFeed:
                     self._sleep(self._backoff(attempt - 1), f["name"])
                 self._check_deadline(deadline_at, f["name"])
                 try:
+                    # Spaces serves the Parquet files as they are: no HTTP compression, every read is file bytes
                     resp = self._download_session.get(urls[f["key"]], stream=True,
+                                                      headers={"Accept-Encoding": "identity"},
                                                       timeout=self._timeouts(f["name"]), allow_redirects=False)
                 except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                    self._check_deadline(deadline_at, f["name"])
                     problem = f"network error: {_describe_error(exc)}"
                     continue
                 try:
@@ -1105,7 +1224,7 @@ class CandleFeed:
                     h, size = hashlib.sha256(), 0
                     folder.unlink(part)            # a stale .part, or a symlink planted in its place, goes first
                     with folder.create_exclusive(part) as out:
-                        for chunk in self._body_chunks(resp):
+                        for chunk in self._body_chunks(resp, f["name"], f["size"], identity_only=True):
                             if not chunk:
                                 continue
                             if size + len(chunk) > f["size"]:
@@ -1116,18 +1235,26 @@ class CandleFeed:
                             size += len(chunk)
                             self._check_deadline(deadline_at, f["name"])
                 except (requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+                    self._check_deadline(deadline_at, f["name"])     # out of time wins over the error
                     problem = f"network error: {_describe_error(exc)}"
                     continue
+                except CandleFeedError:
+                    self._check_deadline(deadline_at, f["name"])
+                    raise
                 finally:
                     resp.close()
+                # Nothing is committed unless the whole file arrived in time with the listed size and hash. The
+                # hash was computed while streaming, so it's checked even with verify=False.
+                self._check_deadline(deadline_at, f["name"])
                 if size != f["size"]:
                     problem = f"got {size} bytes, expected {f['size']}"
                     continue
-                if verify and h.hexdigest() != f["sha256"]:
+                if h.hexdigest() != f["sha256"]:
                     problem = "SHA-256 mismatch"
                     continue
                 folder.replace(part, fname)
                 return
+            self._check_deadline(deadline_at, f["name"])
             raise CandleFeedError(f"Could not download {f['name']} after {self.max_retries + 1} attempts: {problem}")
         finally:
             folder.unlink(part)                # every exit: success (already renamed), failure, deadline, error

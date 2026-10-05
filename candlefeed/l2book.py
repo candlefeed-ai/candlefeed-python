@@ -443,7 +443,10 @@ class L2Book:
     ``row_cache_bytes`` limits the decoded diff rows kept between queries (and an hour file must fit in it).
     It is not a bound on total memory: the event index (about 80 bytes per diff event), the decoded
     snapshots, Arrow read buffers and returned frames come on top. Each file is also checked against hard
-    caps from its footer before decoding (see L2BudgetExceeded)."""
+    caps from its footer before decoding (see L2BudgetExceeded).
+
+    An L2Book isn't thread-safe: queries share a cursor and the row cache. Use one instance per thread, or
+    hold a lock around each whole query (including iterating what iterate() yields)."""
 
     def __init__(self, day_dirs: Sequence[Union[str, Path]], cache_hours: int = 2,
                  snapshot_levels: int = 1000, verify: bool = True, row_cache_bytes: int = 2 * 1024 ** 3,

@@ -27,7 +27,7 @@ class CandleFeedError(Exception):
         if self.status_code is not None:
             parts.append(f"HTTP {self.status_code}")
         if self.code:
-            parts.append(self.code)
+            parts.append(str(self.code))
         prefix = f"[{' '.join(parts)}] " if parts else ""
         return f"{prefix}{self.message}"
 

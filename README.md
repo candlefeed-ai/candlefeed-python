@@ -1,6 +1,6 @@
 # candlefeed
 
-**The official Python client for [CandleFeed](https://candlefeed.ai) — crypto market data that lands straight in a pandas DataFrame.**
+**The official Python client for [CandleFeed](https://candlefeed.ai/?utm_source=pypi&utm_medium=readme) — crypto market data that lands straight in a pandas DataFrame.**
 
 OHLCV, funding rates, open interest, liquidations, long/short ratio, taker volume, basis, and Deribit options — across Binance (perp + spot), Bybit, OKX, dYdX, Hyperliquid, Huobi and Deribit. Auth, cursor pagination, and rate limits are handled for you. One call, one DataFrame.
 
@@ -11,6 +11,8 @@ pip install candlefeed
 ```
 
 ## Time to first DataFrame
+
+You'll need an API key: [get a free one](https://candlefeed.ai/signup?utm_source=pypi&utm_medium=readme&utm_campaign=client). Free plan, no card, takes about a minute.
 
 ```python
 from candlefeed import CandleFeed
@@ -41,7 +43,7 @@ export CANDLEFEED_API_KEY=cf_live_...
 cf = CandleFeed()
 ```
 
-Get a key at **[candlefeed.ai](https://candlefeed.ai)**.
+Get a free key at **[candlefeed.ai/signup](https://candlefeed.ai/signup?utm_source=pypi&utm_medium=readme&utm_campaign=client)**.
 
 | Tier | Requests/day | Max rows/request | Symbols | Datasets | History | Exchanges |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -75,7 +77,7 @@ Everything beyond Binance — Bybit, OKX, dYdX, Hyperliquid, Huobi, Deribit — 
 
 ## How far back the data goes
 
-The honest version, because a backtest will find out anyway. Full matrix at **[candlefeed.ai/coverage](https://candlefeed.ai/coverage/)**.
+The honest version, because a backtest will find out anyway. Full matrix at **[candlefeed.ai/coverage](https://candlefeed.ai/coverage/?utm_source=pypi&utm_medium=readme)**.
 
 | Dataset | Depth |
 | --- | --- |
@@ -225,7 +227,8 @@ Python ≥ 3.9, `requests`, and `pandas`. That's the whole dependency surface.
 
 ## Links
 
-- Site & API keys — **https://candlefeed.ai**
-- Pricing — **https://candlefeed.ai/#pricing**
+- Free API key — **[candlefeed.ai/signup](https://candlefeed.ai/signup?utm_source=pypi&utm_medium=readme&utm_campaign=client)**
+- Site — **[candlefeed.ai](https://candlefeed.ai/?utm_source=pypi&utm_medium=readme)**
+- Pricing — **[candlefeed.ai/#pricing](https://candlefeed.ai/?utm_source=pypi&utm_medium=readme#pricing)**
 
 The software is MIT-licensed. CandleFeed data, including samples, is licensed for internal use under Terms §5.3. Published charts, statistics, and research must not include Raw Data or Substantially Raw Derivatives.
