@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- `download_l2_sample` returns the sample licence line as `result["license"]`: "Internal use only. See
+  https://candlefeed.ai/terms (section 5.3)." It also logs that line once per call at INFO on the `candlefeed`
+  logger. The package adds a `NullHandler`, so nothing is printed unless you configure logging, and stdout is
+  left alone.
+
 ## 0.3.2
 
 - New no-account sample download: `CandleFeed(public=True).download_l2_sample("BTCUSDT", "2026-10-01", "data/")`

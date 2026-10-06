@@ -5,6 +5,7 @@
     cf = CandleFeed(api_key="cf_live_...")
     df = cf.get_ohlcv("BTCUSDT", interval="1h", limit=5)
 """
+import logging as _logging
 from importlib.metadata import PackageNotFoundError as _PkgNotFound
 from importlib.metadata import version as _pkg_version
 
@@ -27,6 +28,8 @@ from .exceptions import (
     RateLimitError,
     TierRestrictedError,
 )
+
+_logging.getLogger("candlefeed").addHandler(_logging.NullHandler())
 
 try:
     __version__ = _pkg_version("candlefeed")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -91,6 +92,8 @@ _L2_URL_REFRESH_SECONDS = 12 * 60
 _L2_MAX_DAYS_PER_CALL = 31
 # A BTCUSDT hour file is tens of MB; anything listed above this is refused.
 _L2_MAX_FILE_BYTES = 4 * 1024 ** 3
+L2_SAMPLE_LICENSE = "Internal use only. See https://candlefeed.ai/terms (section 5.3)."
+logger = logging.getLogger("candlefeed")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _L2_DISK_HEADROOM = 64 * 1024 ** 2
 # Bodies are read in small chunks so the download deadline is checked often.
@@ -1016,10 +1019,18 @@ class CandleFeed:
             CandleFeed(public=True).download_l2_sample("BTCUSDT", "2026-10-01", "data/")
 
         Same layout, checks and return value as :meth:`download_l2` (size and SHA-256 before the rename into
-        place, resume, refreshed links). Call ``l2_sample()`` for the days on offer."""
+        place, resume, refreshed links), plus ``license``, the sample licence line. The same line is logged once
+        per call at INFO on the ``candlefeed`` logger, which is silent unless you configure logging. Call
+        ``l2_sample()`` for the days on offer."""
+        try:
+            logger.info(L2_SAMPLE_LICENSE)
+        except Exception:  # the notice is best effort; a broken app log handler mustn't block the download
+            pass
         day = _to_day(date)
-        return self._download_l2(dataset, symbol, day, day, dest_dir, verify, None, max_file_bytes, deadline,
-                                 lister=lambda first, last: self.l2_sample(symbol, first, dataset))
+        result = self._download_l2(dataset, symbol, day, day, dest_dir, verify, None, max_file_bytes, deadline,
+                                   lister=lambda first, last: self.l2_sample(symbol, first, dataset))
+        result["license"] = L2_SAMPLE_LICENSE
+        return result
 
     def _download_l2(self, dataset, symbol, start, end, dest_dir, verify, max_bytes, max_file_bytes, deadline,
                      lister=None):

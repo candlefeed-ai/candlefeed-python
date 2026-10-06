@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List
@@ -728,17 +729,23 @@ def test_without_public_a_missing_key_still_raises(monkeypatch):
         CandleFeed()
 
 
-def test_sample_download_needs_no_key_and_checks_like_download_l2(public_cf, fake_session, storage, tmp_path):
+def test_sample_download_needs_no_key_and_checks_like_download_l2(public_cf, fake_session, storage, tmp_path,
+                                                                   capsys, caplog):
     day = _day("2026-10-01")
     fake_session.queue(_listing([day]))
     _serve(storage, day, [BODY_A, BODY_M])
-    out = public_cf.download_l2_sample("btcusdt", "2026-10-01", tmp_path)
+    with caplog.at_level(logging.INFO, logger="candlefeed"):
+        out = public_cf.download_l2_sample("btcusdt", "2026-10-01", tmp_path)
     target = tmp_path / "book" / "binance" / "BTCUSDT" / "2026-10-01"
     assert (target / "depth" / "00.parquet").read_bytes() == BODY_A and (target / "manifest.json").read_bytes() == BODY_M
     assert out["bytes"] == len(BODY_A) + len(BODY_M) and len(out["downloaded"]) == 2
     assert fake_session.calls[0]["params"] == {"symbol": "BTCUSDT", "date": "2026-10-01", "dataset": "book"}
     assert "X-API-Key" not in fake_session.headers and "X-API-Key" not in storage.headers
     assert not list(target.rglob("*.part"))
+    licence = "Internal use only. See https://candlefeed.ai/terms (section 5.3)."
+    assert out["license"] == licence
+    assert [r.getMessage() for r in caplog.records if r.name == "candlefeed"] == [licence]
+    assert capsys.readouterr().out == ""
 
 
 def test_sample_download_refuses_a_bad_hash_and_refreshes_through_the_sample_endpoint(public_cf, fake_session,
