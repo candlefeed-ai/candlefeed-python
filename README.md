@@ -18,7 +18,7 @@ You'll need an API key: [get a free one](https://candlefeed.ai/signup?utm_source
 from candlefeed import CandleFeed
 
 cf = CandleFeed(api_key="cf_live_...")          # or set CANDLEFEED_API_KEY
-df = cf.get_ohlcv("BTCUSDT", interval="1h", limit=5)
+df = cf.get_ohlcv("BTCUSDT", interval="1h", max_rows=5)   # one request, five rows
 print(df)
 ```
 
@@ -30,7 +30,9 @@ time
 ...
 ```
 
-The frame is indexed by a tz-aware `DatetimeIndex` and every numeric column is a float — ready for `.resample()`, `.rolling()`, or a backtest loop.
+The frame is indexed by a tz-aware `DatetimeIndex` and every numeric column is a float — ready for `.resample()`, `.rolling()`, or a backtest loop. An empty answer has the same columns on an empty `DatetimeIndex`.
+
+Rows come back oldest first. Without `start` the Free plan starts 30 days ago and paid plans start at the beginning of the archive, so `max_rows=5` gives the first five hours of that range, not the latest five.
 
 ## Authentication
 
@@ -60,7 +62,7 @@ Everything beyond Binance — Bybit, OKX, dYdX, Hyperliquid, Huobi, Deribit — 
 
 | Method | Data | Key params |
 | --- | --- | --- |
-| `get_ohlcv` / `get_candles` | OHLCV candles | `symbol, exchange, interval, start, end, limit` |
+| `get_ohlcv` / `get_candles` | OHLCV candles | `symbol, exchange, interval, start, end, max_rows` |
 | `get_funding_rates` | Per-exchange funding | `symbol, exchange, ...` |
 | `get_funding_rates_aggregated` | OI-weighted funding across venues | `symbol, interval, exchanges` |
 | `get_open_interest` | Open interest | `symbol, exchange, interval` |
@@ -105,8 +107,45 @@ df = cf.get_funding_rates(
 )            # many pages → a single tidy frame
 ```
 
-Cap the result with `max_rows=...`, control page size with `limit=...`, or disable
-auto-paging entirely with `paginate=False` to fetch a single page and inspect the cursor yourself.
+Every page is a request against your daily quota (100 a day on Free), so the paging parameters matter:
+
+| Parameter | Meaning |
+| --- | --- |
+| `max_rows` | Cap on the rows returned. The client stops as soon as it has them, and asks for no more than that per request. |
+| `page_size` | Rows per request. Defaults to 10,000 (5,000 for `get_combined` and `get_liquidations_aggregated`); the server trims it to your plan's maximum, so Free gets 1,000 and Builder 10,000. |
+| `limit` | The older name for `page_size`. It is not a row cap: `limit=5` pages through the whole range five rows at a time. A `limit` under 1,000 on a paging call without `max_rows` raises a `UserWarning` that says so. |
+| `paginate=False` | One request only. |
+| `cursor` | Continue from a server cursor, such as `e.resume_cursor` below. Pass it back exactly as you got it. |
+
+Paging follows the API's `next_cursor` verbatim and stops when there is none or a page comes back empty.
+Cursors are opaque: some endpoints send a compound value rather than a timestamp, so never parse one or pass it
+as `start`.
+
+If a request fails partway through a long range, the exception carries the rows already fetched as
+`e.partial` (a DataFrame) and `e.resume_cursor`, the cursor the failed request sent. Repeat the call with the
+same arguments plus `cursor=e.resume_cursor`, then `pd.concat([e.partial, rest])`:
+
+```python
+import pandas as pd
+from candlefeed import CandleFeedError
+
+try:
+    df = cf.get_ohlcv("BTCUSDT", interval="1m", start="2026-09-01", end="2026-10-01")
+except CandleFeedError as e:
+    if e.resume_cursor is None:
+        raise
+    rest = cf.get_ohlcv("BTCUSDT", interval="1m", start="2026-09-01", end="2026-10-01", cursor=e.resume_cursor)
+    df = pd.concat([e.partial, rest])
+```
+
+`get_liquidations_aggregated` has no cursor. It returns `meta.total` instead, and the client keeps asking, each
+time from the open of the bucket after the last one returned and with room for one repeated bucket (8h is
+summed from 4h rows read from 4 h before `start`), until it has every row; repeats are dropped,
+and a request that brings nothing new while rows remain raises `CandleFeedError` (code `incomplete_result`)
+rather than returning a short frame. Its exceptions carry `e.resume_start` (pass it as `start`) instead of a
+cursor: the open of the bucket after the last complete one in `e.partial`. A `start` on a bucket open returns
+buckets from that open on, so `pd.concat([e.partial, rest])` has no duplicate or partial bucket. Passing `limit` on its own keeps the old single-request behaviour and warns when that page holds fewer
+rows than `meta.total`.
 
 ## Multi-exchange, time-aligned
 
@@ -121,8 +160,9 @@ agg[["weighted_funding_rate", "total_oi_usd", "exchange_count"]].tail()
 ```python
 panel = cf.get_combined(
     "BTCUSDT", interval="1h",
-    fields=["ohlcv", "funding_rate", "open_interest"],
-)   # OHLCV base timeline with funding + OI forward-filled onto each candle
+    fields=["ohlcv", "funding_rate", "open_interest", "liquidations"],
+    start="2026-09-01",
+)   # OHLCV timeline; funding + OI forward-filled, liquidations summed per candle (0 when none)
 ```
 
 ## Order book (L2) and tick trades: daily files
@@ -215,7 +255,7 @@ try:
 except TierRestrictedError as e:
     print(e.message)        # "...requires the Advanced plan or higher... Upgrade at https://candlefeed.ai/pricing"
 except RateLimitError as e:
-    print("retry after", e.retry_after, "seconds")
+    print("limit resets at", e.reset_at, "in", e.retry_after, "seconds")
 except (AuthenticationError, InvalidParameterError) as e:
     print(e.code, e.message)
 ```
@@ -225,11 +265,11 @@ except (AuthenticationError, InvalidParameterError) as e:
 | `AuthenticationError` | 401 | missing / invalid / revoked key |
 | `TierRestrictedError` | 403 | symbol, dataset, exchange, or history window above your plan |
 | `InvalidParameterError` | 400 / 422 | bad symbol, interval, or timestamp |
-| `RateLimitError` | 429 | raised only after the client's bounded backoff retries are exhausted |
+| `RateLimitError` | 429 | short waits retried first; the daily request limit (or any wait over `max_retry_wait`) raises at once |
 | `QuotaExceededError` | 429 | L2 monthly sample allowance or daily download limit reached; not retried |
 | `CandleFeedError` | — | base class; network / unexpected errors |
 
-On HTTP 429 the client honors `Retry-After` / `X-RateLimit-Reset` and retries with exponential backoff before giving up. Remaining-quota headers are exposed on `cf.last_rate_limit`.
+On HTTP 429 the client reads `Retry-After` (seconds or an HTTP date) or `X-RateLimit-Reset`. A wait of up to `max_retry_wait` seconds (default 60) is slept through and retried, and every other retry wait (backoff after network errors, 429s without a wait header and 5xx) is cut to `max_retry_wait` too, so `max_retry_wait=0` retries at once, with waits over 5 s logged at WARNING on the `candlefeed` logger. A longer wait, such as the daily request limit that resets at 00:00 UTC, raises `RateLimitError` straight away with `retry_after` and `reset_at` set, instead of blocking until midnight. `CandleFeed(max_retry_wait=None)` restores the old wait-however-long behaviour. HTTP 500, 502, 503 and 504 are retried with backoff too; pages already fetched are kept. Remaining-quota headers are exposed on `cf.last_rate_limit`.
 
 ## Requirements
 

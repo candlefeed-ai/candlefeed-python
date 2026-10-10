@@ -1,7 +1,8 @@
 """Exception hierarchy for the CandleFeed client."""
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class CandleFeedError(Exception):
@@ -9,7 +10,20 @@ class CandleFeedError(Exception):
 
     Carries the API error ``code`` and ``message`` from the response envelope
     (``{"status": "error", "code": ..., "message": ...}``) when available.
+
+    When an auto-paginating call fails after some pages arrived, ``partial`` is a
+    DataFrame of the rows fetched so far and ``resume_cursor`` the server cursor
+    the failed request sent. To carry on, repeat the call with the same
+    arguments plus ``cursor=exc.resume_cursor``. The cursor is opaque (it can
+    be a compound value): pass it back unchanged, never as ``start``. Endpoints
+    without a cursor (``get_liquidations_aggregated``) set ``resume_start``
+    instead, to pass as ``start``. All are ``None`` otherwise.
     """
+
+    partial: Optional[Any] = None
+    partial_rows: Optional[List[Dict[str, Any]]] = None
+    resume_cursor: Optional[str] = None
+    resume_start: Optional[str] = None
 
     def __init__(
         self,
@@ -49,10 +63,13 @@ class InvalidParameterError(CandleFeedError):
 
 
 class RateLimitError(CandleFeedError):
-    """Raised on HTTP 429 after the client's retries are exhausted.
+    """Raised on HTTP 429 after the client's retries are exhausted, or at once when
+    the server asks for a longer wait than the client's ``max_retry_wait`` (the
+    daily request limit, which resets at 00:00 UTC).
 
     ``retry_after`` is the server-advertised seconds until the limit resets
-    (from the ``Retry-After`` header), when present.
+    (from ``Retry-After``, in seconds or as an HTTP date, or ``X-RateLimit-Reset``)
+    and ``reset_at`` the same moment as a UTC datetime, when known.
     """
 
     def __init__(
@@ -61,8 +78,10 @@ class RateLimitError(CandleFeedError):
         code: Optional[str] = None,
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
+        reset_at: Optional[datetime] = None,
     ) -> None:
         self.retry_after = retry_after
+        self.reset_at = reset_at
         super().__init__(message, code=code, status_code=status_code)
 
 

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.3.4
+
+- Timestamps that mix whole seconds and fractions in one response (`...:01+00:00` next to
+  `...:01.123000+00:00`, which tick liquidations and Hyperliquid funding produce) are parsed correctly. Before,
+  pandas inferred one format from the first row and every row in the other format got a NaT index. Any
+  timestamp that still can't be parsed now raises `CandleFeedError` (code `unparseable_timestamp`) instead of
+  becoming NaT.
+- `max_rows=N` now asks for at most N rows per request, so `get_ohlcv(..., max_rows=5)` is one request. The
+  README's first example used `limit=5`, which is a page size: it paged through the whole range five rows at a
+  time and could use the Free plan's 100 daily requests in one call. The example now uses `max_rows=5`.
+- New `page_size=` on every paging method, the clearer name for `limit`. `limit` still means rows per request,
+  as before. A `limit` under 1,000 on a paging call without `max_rows` raises a `UserWarning` explaining that,
+  and passing both `limit` and `page_size` with different values raises `InvalidParameterError`.
+- Without `limit`, `page_size` or `max_rows`, each request now asks for 10,000 rows (5,000 on `/combined` and
+  aggregated liquidations) instead of the server default of 1,000 (100 on `/basis` and `/combined`). The server
+  trims it to the plan's maximum, so Free still gets 1,000 per request and Builder fetches a year of 1h candles
+  in one request instead of nine. A single `paginate=False` call can now return up to that many rows.
+- A 429 whose `Retry-After` is longer than the new `max_retry_wait` (default 60 s) raises `RateLimitError` at
+  once, with `retry_after` and the new `reset_at` (UTC datetime) set, instead of sleeping. Before, the daily
+  request limit made the client sleep until 00:00 UTC, up to four times. Every other retry wait (network errors,
+  429s without a wait header, 5xx) is cut to `max_retry_wait`; 0 retries at once. It must be a finite number of
+  seconds, 0 or more, or `None`, which keeps the old wait-however-long behaviour. Waits over 5 s are logged at
+  WARNING on the `candlefeed` logger.
+- `Retry-After` given as an HTTP date is honoured; it used to be ignored in favour of short backoff.
+- HTTP 500, 502, 503 and 504 on API requests are retried with backoff (and a `Retry-After` capped at
+  `max_retry_wait`), keeping the pages already fetched. If retries run out, the exception carries the rows so
+  far as `partial` (a DataFrame) and `resume_cursor`, the server cursor the failed request sent.
+- New `cursor=` on every cursor-paginated method: repeat a failed call with `cursor=e.resume_cursor` to carry on.
+  Cursors are passed back verbatim and never parsed, so compound cursors (`"<time>~<tiebreak>"`) work. Paging
+  also stops on an empty page, not only when `next_cursor` or `has_more` says so.
+- `get_liquidations_aggregated` asks for 5,000 rows (the endpoint maximum) and pages until it has
+  `meta.total` rows. Each follow-up starts at the open of the bucket after the last one returned and asks for
+  one extra row: 8h is summed from 4h rows read from 4 h before `start`, which repeats the last bucket once,
+  and a bucket-aligned inclusive start doesn't. Repeated buckets are dropped, a follow-up that brings nothing new while rows remain raises `CandleFeedError` (code
+  `incomplete_result`) with `partial` and `resume_start` (an empty page while `meta.total` is positive counts
+  as no progress too), and a `next_cursor`, if the API ever sends one here, is followed verbatim. `resume_start`
+  is the open of the bucket after the last complete one returned, and a `start` on a bucket open drops buckets
+  labelled before it, so resuming with `start=e.resume_start` can't return a duplicate or partly rebuilt
+  bucket. It used to stop at the server's
+  default of 1,000 rows: a Binance BTC `1d` series from 2019 ended in June 2022. Passing `limit` alone keeps the
+  single-request behaviour and now warns when the page holds fewer rows than `meta.total`. New `paginate`,
+  `max_rows` and `page_size` parameters.
+- Tick liquidation rows carry `position_side`, the liquidated position (long or short) on every exchange; a
+  row's `side` stays the exchange's raw value. The docstring says which raw value means what per venue, and an
+  empty tick frame includes the column.
+- Empty results have the endpoint's columns on an empty UTC `DatetimeIndex` instead of a bare `DataFrame()`,
+  so `df["close"]` and `df.resample()` work on a quiet window. `get_combined` gets the OHLCV columns plus those
+  of each requested field.
+- `download_l2` over a range longer than 31 days no longer raises `TierRestrictedError` when one of its 31-day
+  parts has no 1st of the month on a plan below Pro. Those days are listed under `missing` with reason
+  `plan_restricted`, and the files from the other parts are returned. A range with no 1st of the month at all
+  still raises.
+
 ## 0.3.3
 
 - `download_l2_sample` returns the sample licence line as `result["license"]`: "Internal use only. See

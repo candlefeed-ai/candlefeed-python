@@ -1,14 +1,17 @@
 """CandleFeed API client — pandas-native access to crypto market data."""
 from __future__ import annotations
 
+import email.utils
 import functools
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
 import threading
 import time
+import warnings
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError as _PkgNotFound
@@ -49,6 +52,17 @@ SIGNUP_URL = "https://candlefeed.ai/signup?utm_source=client&utm_medium=error"
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_REQUEST_DEADLINE = 60.0
+# A 429 or 5xx asking for a longer wait than this is raised instead of slept through (the daily request
+# limit answers with the seconds to 00:00 UTC).
+DEFAULT_MAX_RETRY_WAIT = 60.0
+_LOG_SLEEP_OVER = 5.0
+_RETRYABLE_5XX = (500, 502, 503, 504)
+# Rows per request when the caller doesn't choose: the server clamps it to the plan's maximum (1,000 on Free,
+# 10,000 on Builder). 10,000 keeps a page well inside request_deadline and the 64 MiB body cap.
+DEFAULT_PAGE_SIZE = 10_000
+_PAGE_SIZE = {"combined": 5_000, "liquidations/aggregated": 5_000}
+# Below this, an explicit limit= on an auto-paginating call is almost always meant as a row count.
+_SMALL_PAGE = 1_000
 
 # Intervals the API accepts per dataset. Exposed for reference/validation in
 # calling code — the client itself does not reject unknown values, so a newly
@@ -82,6 +96,59 @@ _NUMERIC_COLUMNS = {
 # Candidate timestamp column names, in priority order. The API uses ``time`` on
 # most endpoints and ``timestamp`` on the aggregated ones.
 _TIME_COLUMNS = ("time", "timestamp")
+
+# Index name and columns of each endpoint's rows, so an empty answer still has the frame's shape.
+_SCHEMAS = {
+    "candles": ("time", ("open", "high", "low", "close", "volume", "quote_volume")),
+    "funding-rates": ("time", ("funding_rate", "mark_price", "interval_hours")),
+    "funding-rates/aggregated": ("timestamp", ("symbol", "weighted_funding_rate", "total_oi_usd", "exchange_count",
+                                               "contributing_exchanges")),
+    "open-interest": ("time", ("open_interest", "open_interest_value")),
+    "liquidations": ("time", ("count", "long_liq_usd", "short_liq_usd", "total_liq_usd")),
+    "liquidations/tick": ("time", ("side", "quantity", "price", "usd_value", "position_side")),
+    "liquidations/aggregated": ("timestamp", ("exchange", "symbol", "interval", "long_liq_usd", "short_liq_usd")),
+    "long-short-ratio": ("time", ("ratio_type", "long_short_ratio", "long_account_ratio", "short_account_ratio")),
+    "taker-volume": ("time", ("buy_volume", "sell_volume", "buy_sell_ratio")),
+    "basis": ("time", ("open_basis", "close_basis", "open_change", "close_change")),
+    "combined": ("time", ("open", "high", "low", "close", "volume", "quote_volume")),
+    "options": ("time", ("currency", "instrument_name", "expiry", "strike", "option_type", "mark_price", "mark_iv",
+                         "delta", "gamma", "vega", "theta", "rho", "open_interest", "volume", "bid_price",
+                         "ask_price", "underlying_price", "index_price")),
+}
+# Columns each /combined field adds to the OHLCV base timeline (api/routers/combined.py FIELD_CONFIG).
+_COMBINED_FIELDS = {
+    "ohlcv": (),
+    "open_interest": ("open_interest", "open_interest_value"),
+    "funding_rate": ("funding_rate", "mark_price"),
+    "long_short": ("long_short_ratio", "long_account_ratio", "short_account_ratio"),
+    "taker_volume": ("buy_volume", "sell_volume", "buy_sell_ratio"),
+    "liquidations": ("liquidation_count", "liquidation_volume_usd"),
+}
+# Aggregated liquidation bucket widths. A follow-up request starts at the next bucket's open. Intervals the
+# deployed API rolls up from 4h rows read from 4 h before `start` (8h today) then repeat the last bucket once,
+# so follow-ups ask for one extra row and repeats are dropped.
+_AGG_WIDTHS = {"1h": timedelta(hours=1), "4h": timedelta(hours=4), "6h": timedelta(hours=6),
+               "8h": timedelta(hours=8), "12h": timedelta(hours=12), "1d": timedelta(days=1)}
+_AGG_MAX_LIMIT = 5_000
+_AGG_ORIGIN = pd.Timestamp("2000-01-03", tz="UTC")       # time_bucket's default origin
+_PANDAS_2 = int(pd.__version__.split(".")[0]) >= 2
+
+
+def _parse_times(values) -> pd.Series:
+    """UTC timestamps from ISO 8601 strings that may mix precisions (``...:01+00:00`` next to
+    ``...:01.123000+00:00``), offsets and ``Z``. Without format="ISO8601", pandas 2 infers one format from the
+    first value and coerces every other-format value to NaT."""
+    if _PANDAS_2:
+        return pd.to_datetime(values, utc=True, errors="coerce", format="ISO8601")
+    return pd.to_datetime(values, utc=True, errors="coerce")     # pandas 1.x parses each value on its own
+
+
+def _duration(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f} h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds:.0f} s"
 
 L2_DATASETS = ("book", "trades")
 # Presigned download links must point here (https, port 443). Override with storage_host= or
@@ -223,15 +290,23 @@ class CandleFeed:
     """Client for the CandleFeed crypto market-data API.
 
     Every data method returns a tidy :class:`pandas.DataFrame` indexed by the
-    parsed timestamp. Range requests auto-paginate (follow ``next_cursor``) and
-    rate limits are retried with bounded backoff.
+    parsed timestamp. Range requests auto-paginate (follow ``next_cursor``), and
+    short rate-limit waits and gateway errors (HTTP 500/502/503/504) are retried
+    with bounded backoff.
+
+    Paging: ``max_rows`` caps the rows returned; ``page_size`` (or its older name
+    ``limit``) is the rows per request, not a cap. Without either, each request
+    asks for 10,000 rows and the server trims that to your plan's maximum.
+    ``cursor`` continues from a server cursor, such as ``resume_cursor`` on an
+    exception raised partway through a range. Cursors are opaque: pass them back
+    unchanged, never as ``start``.
 
     Args:
         api_key: Your CandleFeed API key. Falls back to the ``CANDLEFEED_API_KEY``
             environment variable.
         base_url: API base URL. Defaults to production.
         timeout: Per-request timeout in seconds.
-        max_retries: Max retry attempts on HTTP 429 / transient network errors.
+        max_retries: Max retry attempts on HTTP 429, HTTP 500/502/503/504 and transient network errors.
         request_deadline: Elapsed seconds allowed for one attempt at an API request (default 60), checked
             after every read of the answer and at its end. ``timeout`` only bounds the wait between reads, so
             a server sending a byte at a time could otherwise keep a request open indefinitely. A stall inside
@@ -240,6 +315,11 @@ class CandleFeed:
         public: Make a client without an API key (``CANDLEFEED_API_KEY`` is ignored too, and an ``X-API-Key`` on a
             supplied session is removed from every request). It can only call the no-account endpoints:
             :meth:`l2_sample`, :meth:`download_l2_sample`, :meth:`l2_coverage`, :meth:`l2_gaps`.
+        max_retry_wait: Longest wait, in seconds, before any retry (default 60). Backoff after network errors,
+            429s without a wait header and HTTP 5xx (and a 5xx ``Retry-After``) is cut to it; 0 retries at once.
+            A 429 whose ``Retry-After`` is longer, such as the daily request limit (which resets at 00:00 UTC),
+            raises :class:`RateLimitError` at once with ``retry_after`` and ``reset_at`` set. ``None`` waits
+            however long the server asks. Waits over 5 s are logged at WARNING on the ``candlefeed`` logger.
     """
 
     def __init__(
@@ -253,6 +333,7 @@ class CandleFeed:
         storage_host: Optional[str] = None,
         request_deadline: Optional[float] = DEFAULT_REQUEST_DEADLINE,
         public: bool = False,
+        max_retry_wait: Optional[float] = DEFAULT_MAX_RETRY_WAIT,
     ) -> None:
         key = None if public else (api_key or os.environ.get("CANDLEFEED_API_KEY"))
         if not key and not public:
@@ -268,6 +349,12 @@ class CandleFeed:
         self.timeout = timeout
         self.max_retries = max_retries
         self.request_deadline = request_deadline
+        if max_retry_wait is not None and (isinstance(max_retry_wait, bool)
+                                           or not isinstance(max_retry_wait, (int, float))
+                                           or not math.isfinite(max_retry_wait) or max_retry_wait < 0):
+            raise InvalidParameterError("max_retry_wait must be a finite number of seconds, 0 or more, or None.",
+                                        code="invalid_parameter")
+        self.max_retry_wait = max_retry_wait
         self._local = threading.local()          # download_l2's deadline, per thread
         self._session = session or requests.Session()
         self._session.headers.update(
@@ -372,17 +459,34 @@ class CandleFeed:
                 if code in _NON_RETRYABLE_429:
                     raise QuotaExceededError(message or "Download limit reached.", code=code, status_code=429)
                 retry_after = self._retry_after_seconds(resp)
+                message = message or "Rate limit exceeded."
+                if retry_after is not None and self.max_retry_wait is not None and retry_after > self.max_retry_wait:
+                    reset_at = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+                    raise RateLimitError(
+                        f"{message} The limit resets at {reset_at:%Y-%m-%d %H:%M:%S} UTC, in "
+                        f"{_duration(retry_after)}. Not waiting, because that's longer than max_retry_wait "
+                        f"({self.max_retry_wait:g} s).",
+                        code=code or "rate_limit_exceeded", status_code=429, retry_after=retry_after,
+                        reset_at=reset_at)
                 if attempt < self.max_retries:
                     self._sleep(retry_after if retry_after is not None else self._backoff(attempt), url)
                     attempt += 1
                     continue
-                code, message = self._extract_error(resp)
                 raise RateLimitError(
-                    message or "Rate limit exceeded.",
+                    message,
                     code=code or "rate_limit_exceeded",
                     status_code=429,
                     retry_after=retry_after,
+                    reset_at=(None if retry_after is None
+                              else datetime.now(timezone.utc) + timedelta(seconds=retry_after)),
                 )
+
+            if resp.status_code in _RETRYABLE_5XX and attempt < self.max_retries:
+                wait = self._retry_after_seconds(resp, use_reset=False)
+                wait = self._backoff(attempt) if wait is None else wait
+                self._sleep(wait, f"{url} (HTTP {resp.status_code})")
+                attempt += 1
+                continue
 
             if resp.status_code >= 400:
                 self._raise_for_error(resp)
@@ -432,14 +536,22 @@ class CandleFeed:
                 self.last_rate_limit[header] = resp.headers[header]
 
     @staticmethod
-    def _retry_after_seconds(resp: requests.Response) -> Optional[float]:
+    def _retry_after_seconds(resp: requests.Response, use_reset: bool = True) -> Optional[float]:
         ra = resp.headers.get("Retry-After")
         if ra is not None:
             try:
-                return float(ra)
+                seconds = float(ra)
+                if math.isfinite(seconds):
+                    return max(seconds, 0.0)
             except ValueError:
-                pass
-        reset = resp.headers.get("X-RateLimit-Reset")
+                try:
+                    when = email.utils.parsedate_to_datetime(ra)
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    pass
+        reset = resp.headers.get("X-RateLimit-Reset") if use_reset else None
         if reset:
             try:
                 reset_dt = datetime.fromisoformat(reset.replace("Z", "+00:00"))
@@ -465,15 +577,28 @@ class CandleFeed:
         params: Dict[str, Any],
         paginate: bool,
         max_rows: Optional[int],
+        page_size: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch rows from a cursor-paginated endpoint."""
+        """Fetch rows from a cursor-paginated endpoint. Each request asks for at most the rows still wanted.
+        Paging follows the server's ``next_cursor`` verbatim (it may be a compound value, not a timestamp) and
+        stops when there is none, ``has_more`` is false or a page is empty. If a request fails after some
+        pages arrived, the error carries them as ``partial_rows`` and the cursor that request sent as
+        ``resume_cursor``."""
         rows: List[Dict[str, Any]] = []
         cursor: Optional[str] = params.get("cursor")
+        size = page_size if page_size is not None else params.get("limit")
         while True:
             page_params = dict(params)
             if cursor is not None:
                 page_params["cursor"] = cursor
-            body = self._request(path, page_params)
+            if size is not None:
+                page_params["limit"] = size if max_rows is None else max(1, min(size, max_rows - len(rows)))
+            try:
+                body = self._request(path, page_params)
+            except CandleFeedError as exc:
+                if rows:
+                    exc.partial_rows, exc.resume_cursor = rows, cursor
+                raise
             page = body.get("data") or []
             rows.extend(page)
 
@@ -481,22 +606,42 @@ class CandleFeed:
                 return rows[:max_rows]
 
             next_cursor = body.get("next_cursor")
-            if not paginate or not body.get("has_more") or not next_cursor:
+            if not paginate or not page or not body.get("has_more") or not next_cursor:
                 return rows
             if next_cursor == cursor:  # guard against a stuck cursor
                 return rows
             cursor = next_cursor
 
     @staticmethod
-    def _to_frame(rows: List[Dict[str, Any]], index: bool = True) -> pd.DataFrame:
-        """Build a tidy DataFrame: parsed datetime index, float numerics."""
+    def _to_frame(rows: List[Dict[str, Any]], index: bool = True, schema=None) -> pd.DataFrame:
+        """Build a tidy DataFrame: parsed datetime index, float numerics. With no rows, the endpoint's
+        columns (``schema`` names an endpoint or is an ``(index name, columns)`` pair) on an empty UTC
+        DatetimeIndex."""
         df = pd.DataFrame(rows)
         if df.empty:
-            return df
+            spec = _SCHEMAS.get(schema) if isinstance(schema, str) else schema
+            if spec is None:
+                return df
+            time_col, columns = spec
+            empty = pd.DataFrame({c: pd.Series(dtype="float64" if c in _NUMERIC_COLUMNS else "object")
+                                  for c in columns})
+            if not index:
+                empty.insert(0, time_col, pd.Series(dtype="datetime64[ns, UTC]"))
+                return empty
+            empty.index = pd.DatetimeIndex([], tz="UTC", name=time_col)
+            return empty
 
         time_col = next((c for c in _TIME_COLUMNS if c in df.columns), None)
         if time_col is not None:
-            df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+            raw = df[time_col]
+            parsed = _parse_times(raw)
+            bad = parsed.isna() & raw.notna()
+            if bad.any():
+                raise CandleFeedError(
+                    f"{int(bad.sum())} of {len(raw)} timestamps in the response couldn't be parsed "
+                    f"(first: {str(raw[bad].iloc[0])[:64]!r}). Refusing to return rows without their times; "
+                    "please report this to support@candlefeed.ai.", code="unparseable_timestamp")
+            df[time_col] = parsed
 
         for col in df.columns:
             if col in _NUMERIC_COLUMNS:
@@ -506,15 +651,47 @@ class CandleFeed:
             df = df.set_index(time_col).sort_index()
         return df
 
+    @staticmethod
+    def _page_size(path: str, limit: Optional[int], page_size: Optional[int], paginate: bool,
+                   max_rows: Optional[int]) -> int:
+        if limit is not None and page_size is not None and limit != page_size:
+            raise InvalidParameterError("Pass page_size or limit (its older name), not both.",
+                                        code="invalid_parameter")
+        size = page_size if page_size is not None else limit
+        for name, value in (("page_size", size), ("max_rows", max_rows)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise InvalidParameterError(f"{name} must be a whole number of at least 1.",
+                                            code="invalid_parameter")
+        if page_size is None and limit is not None and limit < _SMALL_PAGE and paginate and max_rows is None:
+            warnings.warn(
+                f"limit={limit} is the number of rows per request, not a cap on the rows returned: this call "
+                f"follows the cursor through the whole range, {limit} rows per request, and every request "
+                f"counts against your daily quota. For {limit} rows pass max_rows={limit}; to keep small "
+                "pages on purpose pass page_size= instead.", UserWarning, stacklevel=4)
+        return size if size is not None else _PAGE_SIZE.get(path, DEFAULT_PAGE_SIZE)
+
     def _query(
         self,
         path: str,
         params: Dict[str, Any],
         paginate: bool,
         max_rows: Optional[int],
+        page_size: Optional[int] = None,
+        schema=None,
     ) -> pd.DataFrame:
-        rows = self._fetch(path, params, paginate=paginate, max_rows=max_rows)
-        df = self._to_frame(rows)
+        size = self._page_size(path, params.get("limit"), page_size, paginate, max_rows)
+        schema = schema or path
+        try:
+            rows = self._fetch(path, params, paginate=paginate, max_rows=max_rows, page_size=size)
+        except CandleFeedError as exc:
+            partial = getattr(exc, "partial_rows", None)
+            if partial:
+                try:
+                    exc.partial = self._to_frame(partial, schema=schema)
+                except CandleFeedError:
+                    pass
+            raise
+        df = self._to_frame(rows, schema=schema)
         df.attrs["meta"] = dict(self.last_meta)
         return df
 
@@ -531,6 +708,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Historical OHLCV candles.
 
@@ -552,8 +731,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("candles", params, paginate, max_rows)
+        return self._query("candles", params, paginate, max_rows, page_size)
 
     get_candles = get_ohlcv
 
@@ -569,6 +749,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Per-exchange funding rates (``funding_rate``, ``mark_price``).
 
@@ -583,8 +765,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("funding-rates", params, paginate, max_rows)
+        return self._query("funding-rates", params, paginate, max_rows, page_size)
 
     def get_funding_rates_aggregated(
         self,
@@ -596,6 +779,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """OI-weighted funding rate across exchanges.
 
@@ -612,8 +797,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("funding-rates/aggregated", params, paginate, max_rows)
+        return self._query("funding-rates/aggregated", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Open interest
@@ -628,6 +814,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Open interest (``open_interest``, ``open_interest_value``).
 
@@ -640,8 +828,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("open-interest", params, paginate, max_rows)
+        return self._query("open-interest", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Liquidations
@@ -657,13 +846,21 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Liquidation events.
 
         Omit ``interval`` for tick-level rows (``side, quantity, price,
-        usd_value``); pass an interval (``1m, 5m, 15m, 1h, 4h, 1d``) for bucketed
-        ``long_liq_usd / short_liq_usd / total_liq_usd / count``. ``side`` filters
-        to ``long`` or ``short``.
+        usd_value, position_side``); pass an interval (``1m, 5m, 15m, 1h, 4h,
+        1d``) for bucketed ``long_liq_usd / short_liq_usd / total_liq_usd /
+        count``. ``side`` filters to ``long`` or ``short``.
+
+        ``position_side``, the ``side`` filter and the long/short sums all mean
+        the liquidated position, the same on every exchange. A tick row's
+        ``side`` is the exchange's raw value: ``sell`` means a long was
+        liquidated on Binance, Huobi and Hyperliquid, ``buy`` means a long was
+        liquidated on Bybit, and OKX reports ``long``/``short``.
 
         Tick-level liquidations are forward-collected and start in late May 2026
         — OKX 2026-05-27, Binance/Bybit/Hyperliquid 2026-05-28, Huobi
@@ -678,8 +875,10 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("liquidations", params, paginate, max_rows)
+        return self._query("liquidations", params, paginate, max_rows, page_size,
+                           schema="liquidations" if interval else "liquidations/tick")
 
     def get_liquidations_aggregated(
         self,
@@ -689,34 +888,132 @@ class CandleFeed:
         start: TimeLike = None,
         end: TimeLike = None,
         limit: Optional[int] = None,
+        paginate: Optional[bool] = None,
+        max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
     ) -> pd.DataFrame:
         """Pre-aggregated liquidation history (native cross-venue rollup).
 
         Intervals: ``1h, 4h, 6h, 8h, 12h, 1d``. Returns ``long_liq_usd``,
-        ``short_liq_usd`` indexed by ``timestamp``. This endpoint is not
-        cursor-paginated (it returns ``meta.total``); use ``limit`` to size the
-        single page.
+        ``short_liq_usd`` indexed by ``timestamp``.
+
+        This endpoint has no cursor; it returns ``meta.total``, the rows matching
+        the request. By default the client asks for 5,000 rows per request (the
+        endpoint's maximum) and keeps requesting until it has them all: each
+        follow-up starts at the open of the bucket after the last one returned
+        and asks for one extra row, since an interval the API rolls up from 4h
+        rows (8h) repeats the last bucket once; repeated buckets are dropped.
+        Whenever ``start`` falls on a bucket open, buckets labelled before it
+        are dropped, so ``resume_start`` (always the next bucket's open) never
+        brings back a partly rebuilt bucket. If a follow-up brings nothing new while ``meta.total`` says more
+        remains, it raises ``CandleFeedError`` (code ``incomplete_result``) with
+        the rows so far as ``partial`` and ``resume_start``. If the server ever
+        sends a ``next_cursor`` here, it is followed verbatim instead. Passing
+        ``limit`` alone keeps the single-page behaviour of earlier versions (one
+        request of ``limit`` rows); ``paginate=True`` with ``limit`` or
+        ``page_size`` pages through everything. A single page that holds fewer
+        rows than ``meta.total`` raises a ``UserWarning``. ``max_rows`` caps the
+        rows returned.
 
         Depth varies by interval. ``1d`` is the deep series, running from each
         contract's perpetual listing — Binance 2019-09, Bybit 2020-01,
         OKX/Huobi 2022-04, Hyperliquid 2026-05. The sub-daily buckets are
         forward-built and start between 2023 and 2026 by venue, so use
         ``interval="1d"`` for multi-year backtests. The response ``meta`` block
-        carries ``history_from`` for the exact exchange/symbol/interval asked
-        for; it is available afterwards as ``cf.last_meta`` and on the returned
+        (from the first request) carries ``history_from`` for the exact
+        exchange/symbol/interval asked for, and ``total``; it is on the returned
         frame as ``df.attrs["meta"]``.
         """
+        if paginate is None:
+            paginate = limit is None or page_size is not None
+        size = self._page_size("liquidations/aggregated", limit, page_size, False, max_rows)
         params = {
             "symbol": symbol,
             "exchange": exchange,
             "interval": interval,
             "start": _to_iso(start),
             "end": _to_iso(end),
-            "limit": limit,
         }
-        body = self._request("liquidations/aggregated", params)
-        df = self._to_frame(body.get("data") or [])
-        df.attrs["meta"] = dict(self.last_meta)
+        step = _AGG_WIDTHS.get(interval)
+        rows: List[Dict[str, Any]] = []
+        seen: set = set()
+        meta: Optional[Dict[str, Any]] = None
+        last: Optional[pd.Timestamp] = None
+
+        def boundary() -> Optional[pd.Timestamp]:
+            """The start, when it falls on a bucket open. Buckets labelled before it are then dropped: the
+            deployed API rolls 8h up from 4h rows read from 4 h before `start`, which rebuilds the previous
+            bucket from part of its rows. A start inside a bucket keeps the server's own handling."""
+            if step is None or params.get("cursor") or not params.get("start"):
+                return None
+            at = _parse_times([params["start"]])[0]
+            if pd.isna(at) or (at - _AGG_ORIGIN) % step:
+                return None
+            return at
+
+        def fail(exc: CandleFeedError) -> CandleFeedError:
+            if rows:
+                exc.partial_rows = rows
+                exc.resume_cursor, exc.resume_start = params.get("cursor"), params.get("start")
+                try:
+                    exc.partial = self._to_frame(rows, schema="liquidations/aggregated")
+                except CandleFeedError:
+                    pass
+            return exc
+
+        while True:
+            want = size if max_rows is None else max(1, min(size, max_rows - len(rows)))
+            floor = boundary()
+            asked = want
+            if floor is not None:
+                want = min(want + 1, max(size, _AGG_MAX_LIMIT))      # room for one rebuilt previous bucket
+            try:
+                body = self._request("liquidations/aggregated", {**params, "limit": want})
+            except CandleFeedError as exc:
+                raise fail(exc) from None
+            page = body.get("data") or []
+            page_meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+            meta = dict(page_meta) if meta is None else meta
+            labels = _parse_times([r.get("timestamp") for r in page]) if page else []
+            fresh = []
+            for r, at in zip(page, labels):
+                key = r.get("timestamp")
+                if key not in seen and (floor is None or pd.isna(at) or at >= floor):
+                    seen.add(key)
+                    fresh.append(r)
+            if not paginate:
+                fresh = fresh[:asked]
+            rows.extend(fresh)
+            if max_rows is not None and len(rows) >= max_rows:
+                rows = rows[:max_rows]
+                break
+            if not paginate:
+                total = page_meta.get("total")
+                if isinstance(total, int) and total > len(rows):
+                    warnings.warn(
+                        f"get_liquidations_aggregated returned {len(rows):,} of {total:,} rows (one request of "
+                        f"up to {asked:,}, oldest first). Pass paginate=True for all of them, or a later start.",
+                        UserWarning, stacklevel=2)
+                break
+            next_cursor = body.get("next_cursor")
+            if next_cursor:
+                if not body.get("has_more") or not page or next_cursor == params.get("cursor"):
+                    break
+                params["cursor"] = next_cursor
+                continue
+            total = page_meta.get("total")
+            if not isinstance(total, int) or isinstance(total, bool) or total <= 0 or (page and len(page) >= total):
+                break
+            if not fresh or step is None:          # an empty page or only repeats, while rows remain
+                raise fail(CandleFeedError(
+                    f"liquidations/aggregated stopped making progress after {len(rows):,} rows while meta.total "
+                    f"said {total:,} remained from the last start; the result would be incomplete.",
+                    code="incomplete_result"))
+            newest = _parse_times([r.get("timestamp") for r in fresh]).max()
+            last = newest if last is None else max(last, newest)
+            params["start"] = (last + step).isoformat()
+        df = self._to_frame(rows, schema="liquidations/aggregated")
+        df.attrs["meta"] = meta or {}
         return df
 
     # ------------------------------------------------------------------ #
@@ -733,12 +1030,15 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Long/short account ratio.
 
         Intervals: ``5m, 15m, 1h, 4h, 1d``. ``ratio_type`` is one of
         ``top_account`` (default), ``global_account``, or ``both``. Binance
-        only, from 2020.
+        only, from 2020. With ``both`` at 15m and above, each page holds whole
+        buckets and can exceed ``limit`` by one extra row per additional ratio type.
         """
         params = {
             "symbol": symbol,
@@ -748,8 +1048,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("long-short-ratio", params, paginate, max_rows)
+        return self._query("long-short-ratio", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Taker volume
@@ -763,6 +1064,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Taker buy/sell volume (``buy_volume, sell_volume, buy_sell_ratio``).
 
@@ -774,8 +1077,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("taker-volume", params, paginate, max_rows)
+        return self._query("taker-volume", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Basis
@@ -790,6 +1094,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Futures basis / premium (``open_basis, close_basis, ...``).
 
@@ -805,8 +1111,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("basis", params, paginate, max_rows)
+        return self._query("basis", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Combined
@@ -822,15 +1129,22 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Time-aligned multi-dataset frame on an OHLCV base timeline.
 
         ``fields`` is a comma-separated string or list drawn from ``ohlcv,
         open_interest, funding_rate, long_short, taker_volume, liquidations``;
-        supplementary datasets are forward-filled onto each candle.
+        snapshot datasets are forward-filled onto each candle; liquidations are
+        per-candle totals (0 when none).
         """
         if isinstance(fields, (list, tuple)):
             fields = ",".join(fields)
+        extra: List[str] = []
+        for field in str(fields).split(","):
+            extra += [c for c in _COMBINED_FIELDS.get(field.strip(), ()) if c not in extra]
+        schema = ("time", _SCHEMAS["combined"][1] + tuple(extra))
         params = {
             "symbol": symbol,
             "interval": interval,
@@ -839,8 +1153,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("combined", params, paginate, max_rows)
+        return self._query("combined", params, paginate, max_rows, page_size, schema=schema)
 
     # ------------------------------------------------------------------ #
     # Options
@@ -856,6 +1171,8 @@ class CandleFeed:
         limit: Optional[int] = None,
         paginate: bool = True,
         max_rows: Optional[int] = None,
+        page_size: Optional[int] = None,
+        cursor: Optional[str] = None,
     ) -> pd.DataFrame:
         """Deribit options chain snapshots with greeks and IV (Pro+).
 
@@ -876,8 +1193,9 @@ class CandleFeed:
             "start": _to_iso(start),
             "end": _to_iso(end),
             "limit": limit,
+            "cursor": cursor,
         }
-        return self._query("options", params, paginate, max_rows)
+        return self._query("options", params, paginate, max_rows, page_size)
 
     # ------------------------------------------------------------------ #
     # Metadata
@@ -888,7 +1206,7 @@ class CandleFeed:
         df = pd.DataFrame(body.get("symbols") or [])
         for col in ("available_from", "available_to"):
             if col in df.columns:
-                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+                df[col] = _parse_times(df[col])
         return df
 
     def exchanges(self) -> pd.DataFrame:
@@ -981,7 +1299,10 @@ class CandleFeed:
         file and is renamed into place only after it arrived before the deadline with the size and SHA-256
         the API reported; otherwise the ``.part`` file is deleted. Files already on disk with a matching
         size (and, with ``verify=True``, hash) are skipped, so a rerun resumes. Network errors and 5xx responses are retried with backoff, and expired links
-        are refreshed. Days the API can't serve are returned under ``missing``, not raised.
+        are refreshed. Days the API can't serve are returned under ``missing``, not raised. Below Pro, where
+        only the 1st of each month is served, a 31-day part of the range with no 1st in it is listed under
+        ``missing`` with reason ``plan_restricted``; a whole range without a 1st still raises
+        ``TierRestrictedError``.
 
         Limits: the listing is refused if any file is bigger than ``max_file_bytes`` or the files still
         to fetch add up to more than ``max_bytes`` (checked per 31-day call, before that call downloads
@@ -1053,12 +1374,25 @@ class CandleFeed:
         limits = {"max_bytes": max_bytes, "max_file_bytes": max_file_bytes,
                   "deadline_at": None if deadline is None else time.monotonic() + deadline}
         self._deadline_at = limits["deadline_at"]
+        # Below Pro only the 1st of each month is served, and the API refuses a call whose days are all
+        # restricted. A 31-day window without a 1st inside a longer range that has one is reported as missing.
+        def has_first_of_month(a: date, b: date) -> bool:
+            return a.day == 1 or (a.replace(day=1) + timedelta(days=32)).replace(day=1) <= b
+
         try:
             window = first
             while window <= last:
                 window_end = min(window + timedelta(days=_L2_MAX_DAYS_PER_CALL - 1), last)
-                self._download_l2_window(dataset, symbol, window, window_end, Path(dest_dir), verify, result, limits,
-                                         lister)
+                try:
+                    self._download_l2_window(dataset, symbol, window, window_end, Path(dest_dir), verify, result,
+                                             limits, lister)
+                except TierRestrictedError as exc:
+                    if not has_first_of_month(first, last) or has_first_of_month(window, window_end):
+                        raise
+                    result["missing"].extend(
+                        {"date": (window + timedelta(days=i)).isoformat(), "reason": "plan_restricted",
+                         "message": exc.message}
+                        for i in range((window_end - window).days + 1))
                 window = window_end + timedelta(days=1)
         finally:
             self._deadline_at = None
@@ -1189,9 +1523,15 @@ class CandleFeed:
         return (t, t)
 
     def _sleep(self, seconds: float, what: str) -> None:
+        """Every retry wait goes through here and is clamped to ``max_retry_wait``. A 429 asking for longer
+        than that raises in ``_request`` before getting here."""
+        if self.max_retry_wait is not None:
+            seconds = min(seconds, self.max_retry_wait)
         if self._deadline_at is not None and time.monotonic() + seconds > self._deadline_at:
             raise CandleFeedError(f"Download deadline would pass while waiting to retry {what}; rerun to resume, "
                                   "finished files are kept.", code="download_deadline")
+        if seconds > _LOG_SLEEP_OVER:
+            logger.warning("Waiting %s before retrying %s", _duration(seconds), what)
         time.sleep(seconds)
 
     @staticmethod

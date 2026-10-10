@@ -363,3 +363,13 @@ def test_meta_is_cleared_when_response_has_none(client, fake_session):
 
 def test_user_agent_tracks_package_version(client, fake_session):
     assert fake_session.headers["User-Agent"] == f"candlefeed-python/{__version__}"
+
+
+def test_liquidation_ticks_keep_column_positions_and_docs_explain_position_side():
+    rows = [{"time": "2026-10-08T00:00:00Z", "side": "sell", "quantity": 1.0, "price": 60000.0,
+             "usd_value": 60000.0, "position_side": "long"}]
+    frame = CandleFeed._to_frame(rows)
+    assert frame.reset_index().columns.tolist() == ["time", "side", "quantity", "price", "usd_value", "position_side"]
+    assert frame["position_side"].tolist() == ["long"]
+    doc = CandleFeed.get_liquidations.__doc__
+    assert "position_side" in doc and "Bybit" in doc
