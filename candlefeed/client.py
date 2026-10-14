@@ -58,7 +58,10 @@ DEFAULT_MAX_RETRY_WAIT = 60.0
 _LOG_SLEEP_OVER = 5.0
 _RETRYABLE_5XX = (500, 502, 503, 504)
 # Rows per request when the caller doesn't choose: the server clamps it to the plan's maximum (1,000 on Free,
-# 10,000 on Builder). 10,000 keeps a page well inside request_deadline and the 64 MiB body cap.
+# 10,000 on Builder, 50,000 on Advanced and Pro). 10,000 rather than 50,000 so that one page of wide rows (options
+# chains, combined) stays well inside request_deadline and the 64 MiB body cap on any plan, and a failed request
+# costs one small page to retry. Advanced and Pro pulls of millions of rows can pass page_size=50_000 for a fifth of
+# the requests.
 DEFAULT_PAGE_SIZE = 10_000
 _PAGE_SIZE = {"combined": 5_000, "liquidations/aggregated": 5_000}
 # Below this, an explicit limit= on an auto-paginating call is almost always meant as a row count.
@@ -124,9 +127,10 @@ _COMBINED_FIELDS = {
     "taker_volume": ("buy_volume", "sell_volume", "buy_sell_ratio"),
     "liquidations": ("liquidation_count", "liquidation_volume_usd"),
 }
-# Aggregated liquidation bucket widths. A follow-up request starts at the next bucket's open. Intervals the
-# deployed API rolls up from 4h rows read from 4 h before `start` (8h today) then repeat the last bucket once,
-# so follow-ups ask for one extra row and repeats are dropped.
+# Aggregated liquidation bucket widths. A follow-up request starts at the next bucket's open. API versions before
+# October 2026 rebuilt the bucket before a bucket-aligned start of an 8h rollup, so a follow-up asks for one extra
+# row and drops buckets it has already returned or that are labelled before its start. The current API returns
+# whole buckets from the start, and the extra row is simply the next bucket.
 _AGG_WIDTHS = {"1h": timedelta(hours=1), "4h": timedelta(hours=4), "6h": timedelta(hours=6),
                "8h": timedelta(hours=8), "12h": timedelta(hours=12), "1d": timedelta(days=1)}
 _AGG_MAX_LIMIT = 5_000
@@ -275,6 +279,25 @@ def _no_key_in_errors(method):
     return wrapper
 
 
+def _validation_summary(detail: List[Any], scrub=None) -> Optional[str]:
+    """FastAPI's 422 body lists each rejected field as {"loc": [...], "msg": "..."}. Keep the string and integer
+    parts only: ``query.limit: Input should be less than or equal to 5000``. ``scrub`` runs on the whole text
+    before it's cut to 300 characters, so a cut can't leave part of a key behind."""
+    parts = []
+    for item in detail[:3]:
+        if not isinstance(item, dict) or not isinstance(item.get("msg"), str):
+            continue
+        loc = item.get("loc")
+        where = ".".join(str(x) for x in loc if isinstance(x, (str, int)) and not isinstance(x, bool)) \
+            if isinstance(loc, (list, tuple)) else ""
+        parts.append(f"{where}: {item['msg']}" if where else item["msg"])
+    if not parts:
+        return None
+    text = "; ".join(parts)
+    text = scrub(text) if scrub else text
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
 def _to_iso(value: TimeLike) -> Optional[str]:
     """Normalize a datetime/str to an ISO8601 string the API accepts."""
     if value is None:
@@ -298,8 +321,13 @@ class CandleFeed:
     ``limit``) is the rows per request, not a cap. Without either, each request
     asks for 10,000 rows and the server trims that to your plan's maximum.
     ``cursor`` continues from a server cursor, such as ``resume_cursor`` on an
-    exception raised partway through a range. Cursors are opaque: pass them back
+    exception raised partway through a range, or from ``df.attrs["next_cursor"]``
+    after ``max_rows`` or ``paginate=False``. Cursors are opaque: pass them back
     unchanged, never as ``start``.
+
+    Ranges: ``start`` and ``end`` are inclusive. Candles and resampled intervals
+    return whole buckets, from the bucket containing ``start`` through the bucket
+    containing ``end``.
 
     Args:
         api_key: Your CandleFeed API key. Falls back to the ``CANDLEFEED_API_KEY``
@@ -314,7 +342,7 @@ class CandleFeed:
         session: Optional pre-configured :class:`requests.Session`.
         public: Make a client without an API key (``CANDLEFEED_API_KEY`` is ignored too, and an ``X-API-Key`` on a
             supplied session is removed from every request). It can only call the no-account endpoints:
-            :meth:`l2_sample`, :meth:`download_l2_sample`, :meth:`l2_coverage`, :meth:`l2_gaps`.
+            :meth:`l2_sample`, :meth:`download_l2_sample`, :meth:`l2_coverage`, :meth:`l2_gaps`, :meth:`status`.
         max_retry_wait: Longest wait, in seconds, before any retry (default 60). Backoff after network errors,
             429s without a wait header and HTTP 5xx (and a 5xx ``Retry-After``) is cut to it; 0 retries at once.
             A 429 whose ``Retry-After`` is longer, such as the daily request limit (which resets at 00:00 UTC),
@@ -372,10 +400,10 @@ class CandleFeed:
                              or DEFAULT_L2_STORAGE_HOST).strip().lower()
         self.last_rate_limit: Dict[str, Optional[str]] = {}
         self._deadline_at = None
-        # ``meta`` block from the most recent response — carries per-request
-        # provenance such as ``history_from`` (earliest bucket available for the
-        # requested exchange/symbol/interval) and ``source`` (native vs
-        # resampled). Also attached to each returned frame as ``df.attrs["meta"]``.
+        # ``meta`` block from the most recent response on any thread, kept for
+        # backwards compatibility. Each returned frame carries its own request's
+        # ``meta`` as ``df.attrs["meta"]``; read that instead when one client is
+        # shared between threads.
         self.last_meta: Dict[str, Any] = {}
 
     def _known_keys(self) -> List[str]:
@@ -385,6 +413,11 @@ class CandleFeed:
             headers = getattr(getattr(self, name, None), "headers", None) or {}
             keys += [v for k, v in headers.items() if str(k).lower() == "x-api-key" and isinstance(v, str) and v]
         return sorted(set(keys), key=len, reverse=True)
+
+    def _scrub(self, text: str) -> str:
+        for key in self._known_keys():
+            text = text.replace(key, "***")
+        return text
 
     def __repr__(self) -> str:
         # Redact the secret — keep only the non-sensitive environment marker
@@ -455,7 +488,7 @@ class CandleFeed:
                     status_code=resp.status_code)
 
             if resp.status_code == 429:
-                code, message = self._extract_error(resp)
+                code, message = self._extract_error(resp, self._scrub)
                 if code in _NON_RETRYABLE_429:
                     raise QuotaExceededError(message or "Download limit reached.", code=code, status_code=429)
                 retry_after = self._retry_after_seconds(resp)
@@ -503,7 +536,7 @@ class CandleFeed:
             return body
 
     def _raise_for_error(self, resp: requests.Response) -> None:
-        code, message = self._extract_error(resp)
+        code, message = self._extract_error(resp, self._scrub)
         status = resp.status_code
         msg = message or f"HTTP {status} error"
         if status == 401:
@@ -515,7 +548,7 @@ class CandleFeed:
         raise CandleFeedError(msg, code=code, status_code=status)
 
     @staticmethod
-    def _extract_error(resp: requests.Response) -> tuple[Optional[str], Optional[str]]:
+    def _extract_error(resp: requests.Response, scrub=None) -> tuple[Optional[str], Optional[str]]:
         try:
             body = resp.json()
         except ValueError:
@@ -526,6 +559,8 @@ class CandleFeed:
         detail = body.get("detail") if isinstance(body, dict) else None
         if isinstance(detail, str):
             return None, detail
+        if isinstance(detail, list):
+            return None, _validation_summary(detail, scrub)
         envelope = detail if isinstance(detail, dict) else body if isinstance(body, dict) else {}
         code, message = envelope.get("code"), envelope.get("message")
         return (code if isinstance(code, str) else None), (message if isinstance(message, str) else None)
@@ -578,12 +613,25 @@ class CandleFeed:
         paginate: bool,
         max_rows: Optional[int],
         page_size: Optional[int] = None,
+        info: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch rows from a cursor-paginated endpoint. Each request asks for at most the rows still wanted.
         Paging follows the server's ``next_cursor`` verbatim (it may be a compound value, not a timestamp) and
         stops when there is none, ``has_more`` is false or a page is empty. If a request fails after some
         pages arrived, the error carries them as ``partial_rows`` and the cursor that request sent as
-        ``resume_cursor``."""
+        ``resume_cursor``.
+
+        ``info``, if given, is filled from this call's own responses: ``meta`` (the last response's),
+        ``funding_rate_basis`` when the API sent one, ``has_more`` (rows remain after the ones returned, which
+        happens with ``max_rows`` or ``paginate=False``), ``next_cursor`` and ``truncated``.
+
+        Every request asks for at most the rows still wanted, so when the server honours that limit its own
+        ``next_cursor`` is exactly where the returned rows end, and it's passed on as ``next_cursor``. An
+        endpoint that returns whole buckets (resampled long/short with ``ratio_type="both"``) can send more
+        rows than asked for; ``max_rows`` then cuts the page, no cursor marks the cut, and ``next_cursor`` is
+        None with ``truncated`` True: that export can't be resumed mid-page."""
+        info = {} if info is None else info
+        info.update(meta={}, next_cursor=None, has_more=False, truncated=False)
         rows: List[Dict[str, Any]] = []
         cursor: Optional[str] = params.get("cursor")
         size = page_size if page_size is not None else params.get("limit")
@@ -599,24 +647,32 @@ class CandleFeed:
                 if rows:
                     exc.partial_rows, exc.resume_cursor = rows, cursor
                 raise
+            meta = body.get("meta")
+            info["meta"] = dict(meta) if isinstance(meta, dict) else {}
+            if isinstance(body.get("funding_rate_basis"), str):
+                info["funding_rate_basis"] = body["funding_rate_basis"]
             page = body.get("data") or []
             rows.extend(page)
+            next_cursor = body.get("next_cursor")
+            more = bool(page and body.get("has_more") and next_cursor and next_cursor != cursor)
 
             if max_rows is not None and len(rows) >= max_rows:
+                if len(rows) > max_rows:
+                    info.update(has_more=True, truncated=True)
+                else:
+                    info.update(next_cursor=next_cursor if more else None, has_more=more)
                 return rows[:max_rows]
 
-            next_cursor = body.get("next_cursor")
-            if not paginate or not page or not body.get("has_more") or not next_cursor:
-                return rows
-            if next_cursor == cursor:  # guard against a stuck cursor
+            if not more or not paginate:
+                info.update(next_cursor=next_cursor if more else None, has_more=more)
                 return rows
             cursor = next_cursor
 
     @staticmethod
-    def _to_frame(rows: List[Dict[str, Any]], index: bool = True, schema=None) -> pd.DataFrame:
+    def _to_frame(rows: List[Dict[str, Any]], index: bool = True, schema=None, scrub=None) -> pd.DataFrame:
         """Build a tidy DataFrame: parsed datetime index, float numerics. With no rows, the endpoint's
         columns (``schema`` names an endpoint or is an ``(index name, columns)`` pair) on an empty UTC
-        DatetimeIndex."""
+        DatetimeIndex. ``scrub`` cleans a bad timestamp before it's quoted, and before it's cut to length."""
         df = pd.DataFrame(rows)
         if df.empty:
             spec = _SCHEMAS.get(schema) if isinstance(schema, str) else schema
@@ -637,9 +693,11 @@ class CandleFeed:
             parsed = _parse_times(raw)
             bad = parsed.isna() & raw.notna()
             if bad.any():
+                first = str(raw[bad].iloc[0])
+                first = scrub(first) if scrub else first
                 raise CandleFeedError(
                     f"{int(bad.sum())} of {len(raw)} timestamps in the response couldn't be parsed "
-                    f"(first: {str(raw[bad].iloc[0])[:64]!r}). Refusing to return rows without their times; "
+                    f"(first: {first[:64]!r}). Refusing to return rows without their times; "
                     "please report this to support@candlefeed.ai.", code="unparseable_timestamp")
             df[time_col] = parsed
 
@@ -681,18 +739,24 @@ class CandleFeed:
     ) -> pd.DataFrame:
         size = self._page_size(path, params.get("limit"), page_size, paginate, max_rows)
         schema = schema or path
+        info: Dict[str, Any] = {}
         try:
-            rows = self._fetch(path, params, paginate=paginate, max_rows=max_rows, page_size=size)
+            rows = self._fetch(path, params, paginate=paginate, max_rows=max_rows, page_size=size, info=info)
         except CandleFeedError as exc:
             partial = getattr(exc, "partial_rows", None)
             if partial:
                 try:
-                    exc.partial = self._to_frame(partial, schema=schema)
+                    exc.partial = self._to_frame(partial, schema=schema, scrub=self._scrub)
                 except CandleFeedError:
                     pass
             raise
-        df = self._to_frame(rows, schema=schema)
-        df.attrs["meta"] = dict(self.last_meta)
+        df = self._to_frame(rows, schema=schema, scrub=self._scrub)
+        df.attrs["meta"] = info["meta"]
+        df.attrs["next_cursor"] = info["next_cursor"]
+        df.attrs["has_more"] = info["has_more"]
+        df.attrs["truncated"] = info["truncated"]
+        if "funding_rate_basis" in info:
+            df.attrs["funding_rate_basis"] = info["funding_rate_basis"]
         return df
 
     # ------------------------------------------------------------------ #
@@ -787,6 +851,15 @@ class CandleFeed:
         Intervals: ``1h, 4h, 1d``. Returns ``weighted_funding_rate``,
         ``total_oi_usd``, ``exchange_count``, ``contributing_exchanges``,
         indexed by ``timestamp``.
+
+        ``weighted_funding_rate`` is a rate per hour at every interval: each
+        venue's last settlement in the bucket is divided by its own settlement
+        hours before the OI weighting, so a ``4h`` or ``1d`` bucket is still per
+        hour, not the bucket's total. Multiply by 8 for the per-8h figure Binance quotes, or
+        by 24 * 365 for a simple annual rate. ``df.attrs["funding_rate_basis"]``
+        carries the API's label (``"per_hour"``), on empty frames too. The
+        per-venue :meth:`get_funding_rates` and :meth:`get_combined` return raw
+        per-settlement rates instead.
         """
         if isinstance(exchanges, (list, tuple)):
             exchanges = ",".join(exchanges)
@@ -866,6 +939,13 @@ class CandleFeed:
         — OKX 2026-05-27, Binance/Bybit/Hyperliquid 2026-05-28, Huobi
         2026-06-02. There is no pre-2026 tick history on any venue; for
         long-horizon work use :meth:`get_liquidations_aggregated` at ``1d``.
+
+        Hyperliquid liquidations come from Hyperliquid's node fill data from
+        2026-05-28, rebuilt on 10 October 2026 (earlier rows were TWAP order
+        fills). A Hyperliquid row sums the liquidated fills that share a time,
+        side and price, so ``count`` counts rows, not individual fills. A
+        dataset that's switched off raises :class:`CandleFeedError` with code
+        ``dataset_paused``.
         """
         params = {
             "symbol": symbol,
@@ -899,14 +979,15 @@ class CandleFeed:
 
         This endpoint has no cursor; it returns ``meta.total``, the rows matching
         the request. By default the client asks for 5,000 rows per request (the
-        endpoint's maximum) and keeps requesting until it has them all: each
-        follow-up starts at the open of the bucket after the last one returned
-        and asks for one extra row, since an interval the API rolls up from 4h
-        rows (8h) repeats the last bucket once; repeated buckets are dropped.
-        Whenever ``start`` falls on a bucket open, buckets labelled before it
-        are dropped, so ``resume_start`` (always the next bucket's open) never
-        brings back a partly rebuilt bucket. If a follow-up brings nothing new while ``meta.total`` says more
-        remains, it raises ``CandleFeedError`` (code ``incomplete_result``) with
+        endpoint's maximum; a larger ``page_size`` or ``limit`` is cut to 5,000)
+        and keeps requesting until it has them all: each follow-up starts at the
+        open of the bucket after the last one returned. The API returns whole
+        buckets from a bucket-aligned start, so nothing repeats. Earlier API
+        versions rebuilt the bucket before such a start on 8h rollups, so the
+        client still asks for one extra row on follow-ups and drops any bucket
+        it has already returned or that is labelled before the start.
+        ``resume_start`` is always the next bucket's open. If a follow-up brings nothing new while ``meta.total``
+        says more remains, it raises ``CandleFeedError`` (code ``incomplete_result``) with
         the rows so far as ``partial`` and ``resume_start``. If the server ever
         sends a ``next_cursor`` here, it is followed verbatim instead. Passing
         ``limit`` alone keeps the single-page behaviour of earlier versions (one
@@ -926,7 +1007,7 @@ class CandleFeed:
         """
         if paginate is None:
             paginate = limit is None or page_size is not None
-        size = self._page_size("liquidations/aggregated", limit, page_size, False, max_rows)
+        size = min(self._page_size("liquidations/aggregated", limit, page_size, False, max_rows), _AGG_MAX_LIMIT)
         params = {
             "symbol": symbol,
             "exchange": exchange,
@@ -956,7 +1037,7 @@ class CandleFeed:
                 exc.partial_rows = rows
                 exc.resume_cursor, exc.resume_start = params.get("cursor"), params.get("start")
                 try:
-                    exc.partial = self._to_frame(rows, schema="liquidations/aggregated")
+                    exc.partial = self._to_frame(rows, schema="liquidations/aggregated", scrub=self._scrub)
                 except CandleFeedError:
                     pass
             return exc
@@ -966,7 +1047,7 @@ class CandleFeed:
             floor = boundary()
             asked = want
             if floor is not None:
-                want = min(want + 1, max(size, _AGG_MAX_LIMIT))      # room for one rebuilt previous bucket
+                want = min(want + 1, _AGG_MAX_LIMIT)      # room for one rebuilt previous bucket (older API versions)
             try:
                 body = self._request("liquidations/aggregated", {**params, "limit": want})
             except CandleFeedError as exc:
@@ -1012,7 +1093,7 @@ class CandleFeed:
             newest = _parse_times([r.get("timestamp") for r in fresh]).max()
             last = newest if last is None else max(last, newest)
             params["start"] = (last + step).isoformat()
-        df = self._to_frame(rows, schema="liquidations/aggregated")
+        df = self._to_frame(rows, schema="liquidations/aggregated", scrub=self._scrub)
         df.attrs["meta"] = meta or {}
         return df
 
@@ -1136,8 +1217,13 @@ class CandleFeed:
 
         ``fields`` is a comma-separated string or list drawn from ``ohlcv,
         open_interest, funding_rate, long_short, taker_volume, liquidations``;
-        snapshot datasets are forward-filled onto each candle; liquidations are
-        per-candle totals (0 when none).
+        snapshot datasets (open interest, funding, long/short) are forward-filled
+        onto each candle; flows are per-candle sums: taker volume (null where no
+        5-minute taker period starts in the candle) and liquidations (0 when none).
+        ``long_short`` is Binance's global-account ratio. Long/short and taker
+        volume are collected on Binance only, so with any other ``exchange``
+        those columns are null on every row. ``funding_rate`` is the raw rate
+        per settlement (see ``interval_hours`` from :meth:`get_funding_rates`).
         """
         if isinstance(fields, (list, tuple)):
             fields = ",".join(fields)
@@ -1210,12 +1296,13 @@ class CandleFeed:
         return df
 
     def exchanges(self) -> pd.DataFrame:
-        """Supported exchanges with their datasets and symbol counts."""
+        """Exchanges with candles, open interest or funding rates in the last 30 days, with those datasets and
+        symbol counts. Huobi (liquidations only) and Deribit (options only) aren't listed; see :meth:`datasets`."""
         body = self._request("exchanges", {})
         return pd.DataFrame(body.get("exchanges") or [])
 
     def datasets(self) -> pd.DataFrame:
-        """Available datasets and descriptions."""
+        """Every dataset the API serves, with its exchanges and, where it takes an interval, its intervals."""
         body = self._request("datasets", {})
         return pd.DataFrame(body.get("datasets") or [])
 
@@ -1334,13 +1421,14 @@ class CandleFeed:
     @_no_key_in_errors
     def download_l2_sample(self, symbol: str, date: Union[str, date, datetime], dest_dir: Union[str, os.PathLike],
                            dataset: str = "book", verify: bool = True, max_file_bytes: int = _L2_MAX_FILE_BYTES,
-                           deadline: Optional[float] = None) -> Dict[str, Any]:
+                           deadline: Optional[float] = None, max_bytes: Optional[int] = None) -> Dict[str, Any]:
         """Download one no-account sample day, no API key needed::
 
             CandleFeed(public=True).download_l2_sample("BTCUSDT", "2026-10-01", "data/")
 
         Same layout, checks and return value as :meth:`download_l2` (size and SHA-256 before the rename into
-        place, resume, refreshed links), plus ``license``, the sample licence line. The same line is logged once
+        place, resume, refreshed links, ``max_bytes`` and ``deadline``), plus ``license``, the sample licence line.
+        The same line is logged once
         per call at INFO on the ``candlefeed`` logger, which is silent unless you configure logging. Call
         ``l2_sample()`` for the days on offer."""
         try:
@@ -1348,7 +1436,7 @@ class CandleFeed:
         except Exception:  # the notice is best effort; a broken app log handler mustn't block the download
             pass
         day = _to_day(date)
-        result = self._download_l2(dataset, symbol, day, day, dest_dir, verify, None, max_file_bytes, deadline,
+        result = self._download_l2(dataset, symbol, day, day, dest_dir, verify, max_bytes, max_file_bytes, deadline,
                                    lister=lambda first, last: self.l2_sample(symbol, first, dataset))
         result["license"] = L2_SAMPLE_LICENSE
         return result

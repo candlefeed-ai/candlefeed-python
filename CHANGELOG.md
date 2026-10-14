@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.6
+
+- `L2Book.book_at()` reports the anchor snapshot's capture node by its current public label: `BookView.anchor_node`
+  and `to_dict()["anchor"]["node"]` say `tokyo-2` for that node on every day, including days published before
+  14 October 2026, whose files still carry an older label. The files, their SHA-256 checks and the rows `L2Book`
+  reads are unchanged. `candlefeed.l2book.public_node()` maps a label read from a file the same way.
+
+## 0.3.5
+
+- `get_funding_rates_aggregated` frames carry `df.attrs["funding_rate_basis"]` (`"per_hour"`), empty frames
+  included. Before, the client dropped the API's label, and the docstring didn't say that
+  `weighted_funding_rate` is a rate per hour at every interval, so a `4h` or `1d` value was easy to read as per
+  bucket or per 8 hours. The docstring and README now say how to convert it.
+- When `max_rows` or `paginate=False` stops before the end of the range, the frame sets `df.attrs["has_more"]`
+  and carries the cursor to continue from in `df.attrs["next_cursor"]`. Before, the server's cursor was thrown away,
+  and continuing with `start=df.index[-1]` repeated the rows at that time or, nudged forward, skipped tied rows
+  on options, tick liquidations and long/short `both`. Complete frames have `has_more=False` and
+  `next_cursor=None`. Each request asks for no more than the rows still wanted, so the cursor is the API's own
+  and exact. When `max_rows` cuts a page of whole buckets (resampled long/short `both`), there's no cursor for
+  the cut, so `next_cursor` is `None` and the new `df.attrs["truncated"]` is `True`.
+- `df.attrs["meta"]` comes from that call's own responses. It used to be copied from `last_meta`, which another
+  thread sharing the client could overwrite in between. `last_meta` is still set, as the most recent response's.
+- `get_liquidations_aggregated` cuts `page_size` and `limit` to the endpoint's maximum of 5,000. A larger value
+  used to be sent as is and fail with HTTP 422.
+- HTTP 400 and 422 validation errors carry the API's reason, such as
+  `query.limit: Input should be less than or equal to 5000`, instead of a bare `HTTP 422 error`. The text is
+  scrubbed of the API key like every other error.
+- In the `unparseable_timestamp` error, the bad timestamp is scrubbed of the API key before it's quoted and cut
+  to 64 characters.
+- `download_l2_sample` takes `max_bytes`, the same download budget as `download_l2`.
+- `help(candlefeed)` shows `max_rows=5`. It used to show `limit=5`, which pages through the whole range five rows
+  at a time.
+- Docs: the default page stays at 10,000 rows on every plan so a page of wide rows fits the request deadline and
+  body cap; Advanced and Pro can pass `page_size=50_000` for big pulls. The `get_liquidations_aggregated`
+  docstring no longer describes the 8h repeat the API stopped sending. `exchanges()`, `datasets()`,
+  `get_combined()` (long/short and taker are Binance only) and `public=True` (`status()` works too) are
+  described as they behave.
+
 ## 0.3.4
 
 - Timestamps that mix whole seconds and fractions in one response (`...:01+00:00` next to

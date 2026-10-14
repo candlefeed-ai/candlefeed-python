@@ -325,6 +325,16 @@ class _Rows:
     qty: np.ndarray
 
 
+# Capture-node labels renamed after days were published. Published files keep the label they were written with;
+# the views and dicts this module returns show the current one.
+NODE_RENAMES = {"tokyo-vultr": "tokyo-2"}
+
+
+def public_node(label: str) -> str:
+    """The current public label of a capture node, for a label read from a published file."""
+    return NODE_RENAMES.get(label, label)
+
+
 @dataclass
 class _Anchor:
     L: int
@@ -770,7 +780,7 @@ class L2Book:
 
         return BookView(
             time=_ts(t_ms), event_time=_ts(self._E[e]), update_id=int(self._u[e]), segment=int(self._seg[e]),
-            anchor_update_id=anchor.L, anchor_class=anchor.cls, anchor_node=anchor.node,
+            anchor_update_id=anchor.L, anchor_class=anchor.cls, anchor_node=public_node(anchor.node),
             bids=frame(bid_items), asks=frame(ask_items),
             bids_complete=lo is None or (levels is not None and len(bid_items) == levels),
             asks_complete=hi is None or (levels is not None and len(ask_items) == levels),

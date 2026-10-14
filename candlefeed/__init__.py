@@ -3,7 +3,7 @@
     from candlefeed import CandleFeed
 
     cf = CandleFeed(api_key="cf_live_...")
-    df = cf.get_ohlcv("BTCUSDT", interval="1h", limit=5)
+    df = cf.get_ohlcv("BTCUSDT", interval="1h", max_rows=5)
 """
 import logging as _logging
 from importlib.metadata import PackageNotFoundError as _PkgNotFound

@@ -40,8 +40,15 @@ Pass your key directly or via the environment:
 
 ```python
 cf = CandleFeed(api_key="cf_live_...")
-# or
+```
+
+or set the key in your shell and let the client read it:
+
+```bash
 export CANDLEFEED_API_KEY=cf_live_...
+```
+
+```python
 cf = CandleFeed()
 ```
 
@@ -87,18 +94,20 @@ The honest version, because a backtest will find out anyway. Full matrix at **[c
 | Funding rates | Binance 2020 · Hyperliquid hourly from each contract's HL listing (BTC/ETH/SOL 2023-05-12) · OKX Dec 2025 · Bybit Jan 2026 · dYdX Mar 2026 |
 | Open interest | Binance Sep 2020 · other venues Mar 2026 |
 | Liquidations — aggregated | `1d` runs from each contract's listing: Binance 2019-09, Bybit 2020-01, OKX/Huobi 2022-04, Hyperliquid 2026-05. Sub-daily buckets are forward-built (2023→2026 by venue) — use `interval="1d"` for multi-year work |
-| Liquidations — tick | Forward-collected from late May 2026: OKX 05-27, Binance/Bybit/Hyperliquid 05-28, Huobi 06-02. No pre-2026 tick history anywhere |
+| Liquidations — tick | From late May 2026: OKX 05-27, Binance/Bybit 05-28 (forward-collected), Hyperliquid 05-28 (rebuilt from node fill data), Huobi 06-02. No pre-2026 tick history anywhere |
 | Long/short ratio, taker volume | Binance only — ratio 2020, taker volume from listing (BTC 2019-09) |
 | Basis (spot–perp) | Binance only, all 52 symbols — 5m from 2026-04-27, 1h from 2025-12-10, 4h from 2025-05-31 |
 | Deribit options | Rolling ~60-day API window (older snapshots archived); greeks native from Jun 2026, Black-76 before that |
 
+Hyperliquid liquidations (tick and aggregated) come from Hyperliquid's node fill data and start on 2026-05-28; new rows usually land 3 to 4 hours after the liquidation. We rebuilt the series on 10 October 2026 because the earlier rows were TWAP order fills, not liquidations. If you fetched Hyperliquid liquidations before then, download them again. Each Hyperliquid liquidation row sums the liquidated fills that share a time, side and price, so `count` counts rows, not individual fills. If we ever switch a dataset off, its calls raise `CandleFeedError` with code `dataset_paused` (HTTP 404).
+
 Symbol universe: 52 on Binance, 50 Bybit, 45 OKX, 19 Hyperliquid, ~5 dYdX.
 
-Where an endpoint knows its own depth it tells you — `meta.history_from` and `meta.source` come back on `cf.last_meta` and on each frame as `df.attrs["meta"]`.
+Where an endpoint knows its own depth it tells you: `meta.history_from` and `meta.source` come back on each frame as `df.attrs["meta"]`, taken from that call's own responses. `cf.last_meta` still holds the most recent response's `meta`, but it's shared by every thread using the client, so read the frame's copy.
 
 ## Date ranges auto-paginate
 
-Ask for a window and the client transparently follows the API's `next_cursor` until the range is complete, concatenating into one DataFrame:
+Ask for a window and the client transparently follows the API's `next_cursor` until the range is complete, concatenating into one DataFrame. This example reaches back further than 30 days, so it needs Builder or above; on Free, use dates from the last 30 days:
 
 ```python
 df = cf.get_funding_rates(
@@ -112,10 +121,29 @@ Every page is a request against your daily quota (100 a day on Free), so the pag
 | Parameter | Meaning |
 | --- | --- |
 | `max_rows` | Cap on the rows returned. The client stops as soon as it has them, and asks for no more than that per request. |
-| `page_size` | Rows per request. Defaults to 10,000 (5,000 for `get_combined` and `get_liquidations_aggregated`); the server trims it to your plan's maximum, so Free gets 1,000 and Builder 10,000. |
+| `page_size` | Rows per request. Defaults to 10,000 (5,000 for `get_combined` and `get_liquidations_aggregated`); the server trims it to your plan's maximum, so Free gets 1,000 and Builder 10,000. Advanced and Pro allow 50,000, but the default stays at 10,000 so a page of wide rows (options chains, combined) finishes well inside the 60-second request deadline and 64 MiB body cap. For pulls of millions of rows on those plans, `page_size=50_000` takes a fifth of the requests. `get_combined` has its own caps because its rows are wider: 500 on Free, 5,000 on Builder, 25,000 on Advanced and Pro, 50,000 on Enterprise. `get_liquidations_aggregated` takes at most 5,000 on every plan, and the client cuts a larger value to that. |
 | `limit` | The older name for `page_size`. It is not a row cap: `limit=5` pages through the whole range five rows at a time. A `limit` under 1,000 on a paging call without `max_rows` raises a `UserWarning` that says so. |
 | `paginate=False` | One request only. |
 | `cursor` | Continue from a server cursor, such as `e.resume_cursor` below. Pass it back exactly as you got it. |
+
+When `max_rows` or `paginate=False` stops before the end of the range, `df.attrs["has_more"]` is `True` and
+`df.attrs["next_cursor"]` is the cursor to continue from. Pass it as `cursor=` rather than restarting at the
+last timestamp: `start` is inclusive, so `start=df.index[-1]` returns the rows at that time again, and on
+endpoints with several rows per timestamp (options chains, tick liquidations, long/short with `ratio_type="both"`)
+nudging `start` forward skips the ones you haven't had yet.
+
+```python
+first = cf.get_options(currency="BTC", start="2026-10-01", max_rows=50_000)
+if first.attrs["has_more"]:
+    rest = cf.get_options(currency="BTC", cursor=first.attrs["next_cursor"], max_rows=50_000)
+```
+
+The client asks each request for no more than the rows still wanted, so `next_cursor` is the API's own cursor
+and marks exactly where the returned rows end. The exception is long/short with `ratio_type="both"` at 15m and
+above, which returns whole buckets and can send a row more than asked for. If `max_rows` cuts such a page,
+`df.attrs["truncated"]` is `True` and `next_cursor` is `None`: there's no cursor for a point inside a bucket, so
+that export can't be resumed mid-page. Drop `max_rows` and let the client page through with the API's cursor, or
+pick a `max_rows` that ends on a bucket boundary.
 
 Paging follows the API's `next_cursor` verbatim and stops when there is none or a page comes back empty.
 Cursors are opaque: some endpoints send a compound value rather than a timestamp, so never parse one or pass it
@@ -139,9 +167,10 @@ except CandleFeedError as e:
 ```
 
 `get_liquidations_aggregated` has no cursor. It returns `meta.total` instead, and the client keeps asking, each
-time from the open of the bucket after the last one returned and with room for one repeated bucket (8h is
-summed from 4h rows read from 4 h before `start`), until it has every row; repeats are dropped,
-and a request that brings nothing new while rows remain raises `CandleFeedError` (code `incomplete_result`)
+time from the open of the bucket after the last one returned, until it has every row. The API returns whole
+buckets from a bucket-aligned start; earlier API versions rebuilt the bucket before it on 8h rollups, so the
+client still leaves room for one extra row and drops any bucket it already has. A request that brings nothing
+new while rows remain raises `CandleFeedError` (code `incomplete_result`)
 rather than returning a short frame. Its exceptions carry `e.resume_start` (pass it as `start`) instead of a
 cursor: the open of the bucket after the last complete one in `e.partial`. A `start` on a bucket open returns
 buckets from that open on, so `pd.concat([e.partial, rest])` has no duplicate or partial bucket. Passing `limit` on its own keeps the old single-request behaviour and warns when that page holds fewer
@@ -149,13 +178,24 @@ rows than `meta.total`.
 
 ## Multi-exchange, time-aligned
 
+Cross-venue funding needs Advanced or above (Builder gets Binance only), and the combined frame with open interest and liquidations needs Builder or above:
+
 ```python
 agg = cf.get_funding_rates_aggregated(
     "BTCUSDT", interval="1h",
     exchanges=["binance", "bybit", "okx"],
+    start="2026-09-01",
 )
 agg[["weighted_funding_rate", "total_oi_usd", "exchange_count"]].tail()
+agg.attrs["funding_rate_basis"]   # "per_hour"
 ```
+
+`weighted_funding_rate` is a rate per hour at every interval, not per settlement and not the bucket's total:
+each venue's settlement is divided by its own settlement hours before the OI weighting, so Hyperliquid's hourly
+prints and Binance's 8-hour prints can be averaged. A Binance-style per-8h figure is `rate * 8`, and a simple
+annual rate is `rate * 24 * 365`. `get_funding_rates` returns each venue's raw rate per settlement with its
+`interval_hours`; divide by it before comparing venues. `get_combined`'s `funding_rate` is the raw rate per
+settlement too.
 
 ```python
 panel = cf.get_combined(
