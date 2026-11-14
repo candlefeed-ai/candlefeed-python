@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.7
+
+- New `candlefeed-freqtrade` command (also `python -m candlefeed.freqtrade` and
+  `candlefeed.freqtrade.export_freqtrade()`): writes CandleFeed candles, funding rates and settlement mark prices
+  into a Freqtrade data directory in the layout Freqtrade 2026.10 reads (feather by default, or parquet), so
+  `freqtrade backtesting` runs on CandleFeed history without `freqtrade download-data`. Binance USD-M perpetuals
+  are written as futures files with `funding_rate` and `mark` files at 1h; Binance spot as spot files.
+  `--open-interest` adds Freqtrade `open_interest` files (Builder plan and above). The mark file holds one row per
+  funding settlement (the mark price Binance reported for it), not an hourly mark-price series. Missing candles
+  are counted, never filled; the candle still open at export time is left out; reruns refetch from the last
+  candle on disk. A settlement without a mark price stops that pair's funding files (Freqtrade would misprice
+  it). Every run refetches funding for the whole range and writes the funding-rate and mark files only if each
+  settlement, older rows included, has a finite rate and a positive mark at the same time. Rows already in a mark
+  file (such as a Freqtrade-downloaded hourly one) are never changed: only missing settlements are added, at
+  CandleFeed's settlement mark, and an existing settlement row with no usable open refuses the pair. Funding
+  timestamps a few milliseconds off the second are floored, as Freqtrade does when it loads them. An existing file in another layout is left alone and reported, and
+  `--no-incremental` refuses rather than reports success when CandleFeed has no rows to replace it with. A plan
+  refusal stops the export, keeps finished files and prints a pricing link.
+- New `freqtrade` extra (`pip install "candlefeed[freqtrade]"`) for pyarrow. The base install is unchanged.
+
 ## 0.3.6
 
 - `L2Book.book_at()` reports the anchor snapshot's capture node by its current public label: `BookView.anchor_node`

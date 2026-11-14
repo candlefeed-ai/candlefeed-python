@@ -61,7 +61,7 @@ Get a free key at **[candlefeed.ai/signup](https://candlefeed.ai/signup?utm_sour
 | Advanced (id `pro`) | 10,000 | 50,000 | all | + Deribit options; L2 sample days only | full | all venues |
 | Pro (id `pro_depth`) | 10,000 | 50,000 | all | Advanced + full published L2 archive | full | all venues |
 
-Builder ($29/month) includes Binance REST datasets; Advanced ($99/month) adds other venues and Deribit options. Both include L2 sample days only: the 1st of each month, subject to the 10 GiB monthly allowance. Pro ($149/month) adds the full published L2 archive. Pro includes the full published L2 archive: book from 2026-06-04 and trades from 2026-06-06 for the original 10 symbols; the other 15 symbols start on 2026-09-26. First days are partial.
+Builder ($29/month) includes Binance REST datasets; Advanced ($99/month) adds other venues and Deribit options. Both include L2 sample days only: the 1st of each month, subject to the 10 GiB monthly allowance. Pro ($149/month) adds the full published L2 archive: book from 2026-06-04 and trades from 2026-06-06 for the original 10 symbols; the other 15 symbols start on 2026-09-26. First days are partial.
 
 Everything beyond Binance — Bybit, OKX, dYdX, Hyperliquid, Huobi, Deribit — needs Advanced or higher.
 
@@ -75,7 +75,7 @@ Everything beyond Binance — Bybit, OKX, dYdX, Hyperliquid, Huobi, Deribit — 
 | `get_open_interest` | Open interest | `symbol, exchange, interval` |
 | `get_liquidations` | Liquidation events (tick or bucketed) | `symbol, exchange, side, interval` |
 | `get_liquidations_aggregated` | Pre-aggregated liquidation history | `symbol, exchange, interval` |
-| `get_long_short_ratio` | Long/short account ratio | `symbol, exchange, interval, ratio_type` |
+| `get_long_short_ratio` | Long/short positioning (historical top_account has mixed metrics; see API docs) | `symbol, exchange, interval, ratio_type` |
 | `get_taker_volume` | Taker buy/sell volume | `symbol, exchange, ...` |
 | `get_basis` | Futures basis / premium | `symbol, exchange, interval` |
 | `get_combined` | Time-aligned multi-dataset frame | `symbol, interval, fields` |
@@ -90,12 +90,12 @@ The honest version, because a backtest will find out anyway. Full matrix at **[c
 
 | Dataset | Depth |
 | --- | --- |
-| OHLCV | Binance spot 2017 · Binance perp 2019 · OKX/Bybit 2020 · Hyperliquid 1d 2023 / 4h 2024 / 1h 2025 / 1m–15m 2026 · dYdX 2025 |
-| Funding rates | Binance 2020 · Hyperliquid hourly from each contract's HL listing (BTC/ETH/SOL 2023-05-12) · OKX Dec 2025 · Bybit Jan 2026 · dYdX Mar 2026 |
-| Open interest | Binance Sep 2020 · other venues Mar 2026 |
+| OHLCV | Binance spot 2017 · Binance perp 2019 · OKX BCH Dec 2019 / BTC Mar 2020 · Bybit Dec 2020 · Hyperliquid 1d 2023 / 4h 2024 / 1h 2025 / 1m–15m 2026 · dYdX 2025 |
+| Funding rates | Binance 2020 · Hyperliquid from 2023-05-12 (BTC/ETH/SOL and 7 others; later contracts from their HL listing), every 8 hours to 2023-06-07, hourly from 2023-06-08 · OKX Dec 2025 · Bybit Jan 2026 · dYdX Mar 2026 |
+| Open interest | Binance BTCUSDT Sep 2020, 15 more symbols Dec 2021 · other venues Mar 2026 |
 | Liquidations — aggregated | `1d` runs from each contract's listing: Binance 2019-09, Bybit 2020-01, OKX/Huobi 2022-04, Hyperliquid 2026-05. Sub-daily buckets are forward-built (2023→2026 by venue) — use `interval="1d"` for multi-year work |
 | Liquidations — tick | From late May 2026: OKX 05-27, Binance/Bybit 05-28 (forward-collected), Hyperliquid 05-28 (rebuilt from node fill data), Huobi 06-02. No pre-2026 tick history anywhere |
-| Long/short ratio, taker volume | Binance only — ratio 2020, taker volume from listing (BTC 2019-09) |
+| Long/short ratio, taker volume | Binance only. Ratio from 2020-05 (daily in parts of 2020–2022). Taker volume: BTC daily from 2019-09-25, 5-minute from 2020-01-01. Symbols added June 2026 start then |
 | Basis (spot–perp) | Binance only, all 52 symbols — 5m from 2026-04-27, 1h from 2025-12-10, 4h from 2025-05-31 |
 | Deribit options | Rolling ~60-day API window (older snapshots archived); greeks native from Jun 2026, Black-76 before that |
 
@@ -279,6 +279,49 @@ incomplete or mixed download raises `IncompleteDay`, and a moment after the last
 file has to sit under its full published key, and each file's rows have to carry the requested symbol.
 The SHA-256 checks prove the files are consistent with what CandleFeed published for that day. They aren't a signature: hashes delivered by the same service as the files can't detect that service itself being compromised or malicious.
 
+## Freqtrade: backtest on CandleFeed history
+
+`candlefeed-freqtrade` writes CandleFeed candles and funding into a Freqtrade data directory, in the layout Freqtrade 2026.10's data handlers read, so `freqtrade backtesting` runs without `freqtrade download-data`. A [free key](https://candlefeed.ai/signup?utm_source=freqtrade&utm_medium=readme) covers BTC, ETH, SOL, XRP and DOGE (USDT) for the last 30 days.
+
+```bash
+pip install "candlefeed[freqtrade]"          # adds pyarrow for feather/parquet
+export CANDLEFEED_API_KEY=cf_live_...
+candlefeed-freqtrade --pairs BTC/USDT:USDT ETH/USDT:USDT --timeframes 15m --days 30 \
+    --datadir user_data/data/binance
+freqtrade backtesting --config config.json --datadir user_data/data/binance \
+    --strategy MyStrategy --timeframe 15m --timerange 20261017-20261114
+```
+
+`--exchange binance` (the default) is Binance USD-M perpetuals and writes Freqtrade futures files; `--exchange binance_spot` writes spot files. Both go in the same `binance` data directory, as Freqtrade expects:
+
+```
+user_data/data/binance/BTC_USDT-1h.feather                          spot candles
+user_data/data/binance/futures/BTC_USDT_USDT-15m-futures.feather    perp candles
+user_data/data/binance/futures/BTC_USDT_USDT-1h-funding_rate.feather
+user_data/data/binance/futures/BTC_USDT_USDT-1h-mark.feather
+```
+
+Candles are `date` (UTC) plus `open, high, low, close, volume`, with `volume` in the base coin as Freqtrade expects. Timeframes are the ones CandleFeed serves: `1m, 5m, 15m, 1h, 4h, 1d`. The default format is feather; `--data-format parquet` works if your config sets `"dataformat_ohlcv": "parquet"`.
+
+Freqtrade charges funding in a futures backtest by multiplying each settlement's rate by the `open` of the mark-price candle at that time. The funding-rate file holds every settlement CandleFeed has, at Binance's own interval for that contract (8h, 4h or 1h). The mark file is not an hourly mark-price series: it has one row per settlement, with open, high, low and close all set to the mark price Binance reported for that settlement, and volume 0. That's exactly the number Freqtrade's fee calculation reads, but don't use the mark file as a price series in a strategy. The funding-rate file uses the two-column layout (`date, funding_rate`) Freqtrade introduced in 2026.8, so futures exports need Freqtrade 2026.8 or later; spot files load in older versions too. Freqtrade fills the hours between settlements forward when it loads the file and logs `Missing data fillup for BTC/USDT:USDT, 1h: before: 85 - after: 673`; that's the mark file, and it's expected.
+
+Missing candles are counted and reported, never filled in, and the candle still open at export time is left out, including one an earlier run or another tool wrote before it closed. Running the same command again fetches from the last candle on disk onwards, so that candle is replaced with the final one. Every funding settlement needs a mark price: if one in your range has none in CandleFeed, Freqtrade would skip it or charge it at another settlement's price, so neither funding file is written for that pair and the exporter lists the settlement times (pass `--no-funding` or pick a `--timerange` that avoids them). Funding is three rows a day on an 8h contract, so every run, reruns included, refetches the whole range's settlements and then checks the files as they'd be written, older rows included: each settlement in the funding-rate file needs a finite rate and a positive mark price at the same time, or neither file is written. That's one funding request per pair for a free key's 30 days; a longer range takes one request per page of settlements (up to 1,000 rows a page on Free, 10,000 on paid plans), and it takes them again on every run. The refetch is also how an interrupted write gets repaired. Rows already in a mark file are never changed. If Freqtrade downloaded an hourly mark file, every candle in it stays as it was, and the exporter only adds rows for settlements the file doesn't have, priced at CandleFeed's settlement mark, which can differ slightly from the open of Binance's hourly mark candle. If an existing row at a settlement time has a zero, negative or missing open, the pair is refused, not overwritten; move the mark file aside or pass `--no-incremental` to rebuild both files. Freqtrade only charges at funding-rate rows, so the extra hours don't change the fees. A file already on disk in another layout is reported and left alone; `--no-incremental` replaces it, and if CandleFeed has no rows for that range it leaves the file alone and says so instead of reporting success. Files are written to a temporary name and renamed into place, so an interrupted run can't leave half a file. `--open-interest` adds `...-open_interest` files (`open_interest_amount` in the base coin, `open_interest_value` in USDT), which a strategy can read with `self.dp.get_pair_dataframe(pair, "1h", candle_type="open_interest")`; each row is CandleFeed's last 5-minute reading in the bucket, stamped with the bucket's start. Open interest needs the Builder plan.
+
+If your plan doesn't cover a request (older than 30 days on Free, another symbol, open interest), the export stops at the first refusal, keeps the files already written and says what the Builder plan adds. The same thing from Python:
+
+```python
+from candlefeed.freqtrade import export_freqtrade
+
+result = export_freqtrade(["BTC/USDT:USDT"], timeframes=["1h"], days=30, datadir="user_data/data/binance")
+for f in result.files:
+    print(f.kind, f.pair, f.rows_written, f.missing, f.path)
+# A refused file or a plan limit doesn't raise: it lands in result.refused or result.error.
+if not result.ok:
+    raise SystemExit("\n".join(result.refused + [result.error or ""]).strip())
+```
+
+Binance's `1000PEPE/USDT:USDT` isn't exported: CandleFeed stores that contract in per-coin units, so its prices wouldn't match Freqtrade's market. A worked example with real output is at [candlefeed.ai/docs/freqtrade](https://candlefeed.ai/docs/freqtrade?utm_source=freqtrade&utm_medium=readme).
+
 ## Error handling
 
 Every API error maps to a typed exception carrying the API `code` and `message`:
@@ -313,7 +356,7 @@ On HTTP 429 the client reads `Retry-After` (seconds or an HTTP date) or `X-RateL
 
 ## Requirements
 
-Python ≥ 3.9, `requests`, and `pandas`. That's the whole dependency surface.
+Python ≥ 3.9, `requests`, and `pandas`. That's the whole dependency surface. The `[l2]` extra adds `pyarrow` and `numpy` for the order book files, and `[freqtrade]` adds `pyarrow` for `candlefeed-freqtrade`.
 
 ## Links
 

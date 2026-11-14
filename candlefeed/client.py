@@ -820,8 +820,10 @@ class CandleFeed:
 
         Native settlement cadence (8h on most venues), not a resampled series.
         Exchanges: ``binance`` (from 2020), ``okx``, ``bybit``, ``dydx``,
-        ``hyperliquid`` — Hyperliquid is hourly and continuous from each
-        contract's HL listing (BTC/ETH/SOL from 2023-05-12).
+        ``hyperliquid``: BTC, ETH, SOL and 7 others start on 2023-05-12, the
+        first day in Hyperliquid's funding history; later contracts start at
+        their HL listing. Hyperliquid settled every 8 hours up to and including
+        the 2023-06-08 00:00 UTC settlement, then hourly from 01:00 that day.
         """
         params = {
             "symbol": symbol,
@@ -892,7 +894,10 @@ class CandleFeed:
     ) -> pd.DataFrame:
         """Open interest (``open_interest``, ``open_interest_value``).
 
-        Intervals: ``5m, 15m, 1h, 4h, 1d``.
+        Intervals: ``5m, 15m, 1h, 4h, 1d``. Each row is the last reading in its
+        bucket, stamped with the bucket's start. At ``5m`` that's one row per
+        5-minute slot, including on OKX, dYdX and Hyperliquid, where we store
+        about two snapshots in each slot.
         """
         params = {
             "symbol": symbol,
@@ -1114,7 +1119,12 @@ class CandleFeed:
         page_size: Optional[int] = None,
         cursor: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Long/short account ratio.
+        """Binance long/short positioning.
+
+        Historical ``top_account`` mixes position ratios and account ratios:
+        bulk rows before 2026-04-18 hold the top-trader position ratio, and
+        their ``long_account_ratio`` is a ratio rather than a share. See the API
+        docs' historical-data note before backtesting across 2026-04-18.
 
         Intervals: ``5m, 15m, 1h, 4h, 1d``. ``ratio_type`` is one of
         ``top_account`` (default), ``global_account``, or ``both``. Binance
@@ -1150,7 +1160,8 @@ class CandleFeed:
     ) -> pd.DataFrame:
         """Taker buy/sell volume (``buy_volume, sell_volume, buy_sell_ratio``).
 
-        True 5-minute data from each symbol's listing (BTC 2019-09). Binance only.
+        Binance only. BTCUSDT is daily from 2019-09-25 and 5-minute from
+        2020-01-01; symbols added in June 2026 start then.
         """
         params = {
             "symbol": symbol,
@@ -1260,7 +1271,7 @@ class CandleFeed:
         page_size: Optional[int] = None,
         cursor: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Deribit options chain snapshots with greeks and IV (Pro+).
+        """Deribit options chain snapshots with greeks and IV (Advanced plan or higher).
 
         ``currency`` is ``BTC`` or ``ETH``. Optional filters: ``instrument_name``,
         ``option_type`` (``C``/``P``), ``expiry`` (``YYYY-MM-DD``).

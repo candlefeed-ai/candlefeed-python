@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "candlefeed"
-version = "0.3.6"
+version = "0.3.7"
 description = "Official Python client for the CandleFeed crypto market-data API — OHLCV, funding, open interest, liquidations, basis, Deribit options across Binance, Bybit, OKX, dYdX, Hyperliquid and Huobi. Returns pandas DataFrames."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +26,7 @@ keywords = [
     "l2",
     "hyperliquid",
     "pandas",
+    "freqtrade",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -51,6 +52,7 @@ dependencies = [
 [project.optional-dependencies]
 polars = ["polars>=0.20"]
 l2 = ["pyarrow>=12", "numpy>=1.21"]
+freqtrade = ["pyarrow>=12"]
 dev = [
     "pytest>=7.0",
     "responses>=0.23",
@@ -59,6 +61,9 @@ dev = [
     "ruff>=0.4",
     "build>=1.0",
 ]
+
+[project.scripts]
+candlefeed-freqtrade = "candlefeed.freqtrade:main"
 
 [project.urls]
 Homepage = "https://candlefeed.ai"
