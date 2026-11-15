@@ -339,20 +339,20 @@ class _Exporter:
         raw = raw.dropna(subset=["funding_rate"])
         dates = raw.index.floor("s")
         mark = _floats(raw["mark_price"])
-        no_mark = dates[~_usable_mark(mark).to_numpy()]
+        # Only settlements the mark file lacks take CandleFeed's mark; a row already there is kept (and checked below).
+        adding = ~dates.isin(old_mk["date"] if old_mk is not None else [])
+        no_mark = dates[adding & ~_usable_mark(mark).to_numpy()]
         if len(no_mark):
             raise _Refused(
                 f"{pair}: {len(no_mark)} funding settlement(s) between {_when(no_mark[0])} and {_when(no_mark[-1])} "
-                "have no mark price in CandleFeed. Freqtrade would leave them out or charge them at another "
-                "settlement's price, so this pair's funding-rate and mark files weren't written. Use a --timerange "
-                "that avoids those settlements, or --no-funding to export candles only.")
+                "have no mark price in CandleFeed and none in the mark file. Freqtrade would leave them out or charge "
+                "them at another settlement's price, so this pair's funding-rate and mark files weren't written. Use a "
+                "--timerange that avoids those settlements, or --no-funding to export candles only.")
         fr = pd.DataFrame({"date": dates, "funding_rate": _floats(raw["funding_rate"]).to_numpy()})
         mk = pd.DataFrame({"date": dates, "open": mark.to_numpy(), "high": mark.to_numpy(), "low": mark.to_numpy(),
-                           "close": mark.to_numpy(), "volume": 0.0})
+                           "close": mark.to_numpy(), "volume": 0.0})[adding].reset_index(drop=True)
         merged_fr = _merge(old_fr, fr)
         _refuse_broken_marks(pair, mk_path, old_mk, merged_fr["date"])
-        if old_mk is not None:
-            mk = mk[~mk["date"].isin(old_mk["date"])].reset_index(drop=True)
         still = _unpriced(merged_fr, _merge(old_mk, mk))
         if not still.empty:
             raise _Refused(

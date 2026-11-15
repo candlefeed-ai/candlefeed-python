@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.8
+
+- New `candlefeed-hftbacktest` command (also `candlefeed.hftbacktest.convert_l2()`): converts downloaded order-book
+  days into hftbacktest 2.4.4's event files, one `.npz` per hour with a `data` array in `event_dtype`, plus
+  `candlefeed_hftbacktest.json` with the file list, counts and per-day recorded receive-latency percentiles
+  (`recorded_recv_latency_*`, for depth and live trades). The book follows
+  `L2Book`'s rebuild rule: it anchors on a snapshot outside any gap, skips diffs before it, applies the straddling
+  diff in full, and on a chain break writes a depth clear for both sides and nothing until the next snapshot.
+  Refresh snapshots are written as a clear down to the snapshot's deepest level plus snapshot rows. A snapshot
+  side with no levels clears that whole side. `--latency` is
+  required and constant: `4ms` sets `local_ts = exch_ts + 4 ms` on every row. `recv` (local times from the capture
+  node's recorded receive times) is refused in this version, because those times include capture-node pauses.
+  `--trades` merges the trades file (aggressor side, trades before depth at equal exchange
+  time): it keeps `MARKET` trades and REST-recovered trades, which the collector writes with a null order type,
+  and drops and counts live trades with a null or any other type. A trades file holding a trade timed outside its
+  UTC day is refused with an error naming the file, the day and the trade time, because the collector files trades
+  by trade time. `exch_ts` is Binance's transaction time `T`, except where `T` steps backwards within a stream: that
+  row is held at the previous row's time and counted under `depth_exch_ts_raised` or `trade_exch_ts_raised`. A
+  snapshot goes in at the earlier of its own `T` and the `T` of the diff it anchors, which those counters don't count. The trades
+  file's `side`, `order_type` and `is_backfill` columns must be string, string and bool, with no nulls except in
+  `order_type`. The book carries across midnight when the next day's chain continues. A day with no usable snapshot
+  is named under `days_without_anchor` and writes only what it still has to carry (a chain-break clear, trades);
+  a range with no usable snapshot at all is refused. Output is written one hour at a time to a temporary name and
+  renamed into place, and the old `candlefeed_hftbacktest.json` is deleted before the first file is replaced, so a
+  failed run never leaves a file list naming a mix of old and new files. Rows stay in exchange-time and local-time
+  order across every file of the range; a file that would start before the previous one's last row stops the run
+  with an error and no file list.
+  Refuses to run on Python 3.14 with numpy below 2.3, which corrupts arrays.
+- New `hftbacktest` extra (`pip install "candlefeed[hftbacktest]"`) for pyarrow and numpy. The base install is unchanged.
+- `candlefeed-freqtrade`: a missing or non-positive CandleFeed mark price at a settlement the mark file already
+  covers with a usable row no longer refuses the pair; the file's row is kept, as documented. A bad CandleFeed mark at
+  a settlement the file lacks, or any bad mark with `--no-incremental` or a fresh export, still refuses it.
+
 ## 0.3.7
 
 - New `candlefeed-freqtrade` command (also `python -m candlefeed.freqtrade` and

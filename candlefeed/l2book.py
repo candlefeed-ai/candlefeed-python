@@ -90,7 +90,7 @@ _ROW_BYTES = 17                       # is_bid (1) + price ticks (8) + qty (8) p
 
 _KIND = {"event_time": "int", "first_update_id": "int", "final_update_id": "int", "prev_final_update_id": "int",
          "segment": "int", "recv_time": "int", "side": "str", "node": "str", "anchor_class": "str", "symbol": "str",
-         "price": "dec", "qty": "dec"}
+         "price": "dec", "qty": "dec", "tx_time": "int", "trade_id": "int", "local_timestamp": "int", "amount": "dec"}
 _WIDTH = {"int": 8, "str": 4, "dec": 16}      # decoded bytes per row; strings are read as dictionary indices
 _STRING_COLS = tuple(c for c, k in _KIND.items() if k == "str")
 
@@ -345,6 +345,7 @@ class _Anchor:
     rows: _Rows
     bid_floor: Optional[int]     # None: the snapshot held the whole side
     ask_ceiling: Optional[int]
+    T: int = 0                   # REST response time (ms) of the copy kept
 
 
 @dataclass(frozen=True)
@@ -647,6 +648,7 @@ class L2Book:
             cls_kept = cls_codes[idx]
             node_kept = ns[keep]
             Lk = L[idx]
+            T_kept = t["event_time"].to_numpy()[idx]
             bounds = np.flatnonzero(np.r_[True, Lk[1:] != Lk[:-1], True])
             for b0, b1 in zip(bounds[:-1], bounds[1:]):
                 Lval = int(Lk[b0])
@@ -661,7 +663,8 @@ class L2Book:
                 anchors.append(_Anchor(
                     L=Lval, j=j, segment=int(self._seg[j]), cls=mine, node=str(node_names[node_kept[b0]]), rows=r,
                     bid_floor=int(bid_t.min()) if len(bid_t) >= self._snapshot_levels else None,
-                    ask_ceiling=int(ask_t.max()) if len(ask_t) >= self._snapshot_levels else None))
+                    ask_ceiling=int(ask_t.max()) if len(ask_t) >= self._snapshot_levels else None,
+                    T=int(T_kept[b0])))
         anchors.sort(key=lambda a: (a.j, a.L))
         self._anchors = anchors
         self._aj = np.array([a.j for a in anchors], dtype=np.int64)
